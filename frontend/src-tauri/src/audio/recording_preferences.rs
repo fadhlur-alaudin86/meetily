@@ -87,7 +87,7 @@ pub fn ensure_recordings_directory(path: &PathBuf) -> Result<()> {
 
 /// Generate a unique filename for a recording
 pub fn generate_recording_filename(format: &str) -> String {
-    let now = chrono::Utc::now();
+    let now = chrono::Local::now();
     let timestamp = now.format("%Y%m%d_%H%M%S");
     format!("recording_{}.{}", timestamp, format)
 }

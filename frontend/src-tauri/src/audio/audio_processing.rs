@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{Local, Utc};
 use log::{debug, info, warn};
 use realfft::num_complex::{Complex32, ComplexFloat};
 use realfft::RealFftPlanner;
@@ -37,7 +37,7 @@ pub fn create_meeting_folder(
     meeting_name: &str,
     create_checkpoints_dir: bool,
 ) -> Result<PathBuf> {
-    let timestamp = Utc::now().format("%Y-%m-%d_%H-%M").to_string();
+    let timestamp = Local::now().format("%Y-%m-%d_%H-%M").to_string();
     let sanitized_name = sanitize_filename(meeting_name);
     let folder_name = format!("{}_{}", sanitized_name, timestamp);
     let meeting_folder = base_path.join(folder_name);
@@ -625,7 +625,7 @@ pub fn write_audio_to_file_with_meeting_name(
     skip_encoding: bool,
     meeting_name: Option<&str>,
 ) -> Result<String> {
-    let timestamp = Utc::now().format("%Y-%m-%d_%H-%M-%S").to_string();
+    let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
     let sanitized_device_name = device.replace(['/', '\\'], "_");
 
     // Create meeting folder if meeting name is provided
@@ -667,7 +667,7 @@ pub fn write_transcript_to_file(
     output_path: &PathBuf,
     meeting_name: Option<&str>,
 ) -> Result<String> {
-    let timestamp = Utc::now().format("%Y-%m-%d_%H-%M-%S").to_string();
+    let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
 
     // Create meeting folder if meeting name is provided (same logic as audio)
     let final_output_path = if let Some(name) = meeting_name {
@@ -702,7 +702,7 @@ pub fn write_transcript_json_to_file(
 ) -> Result<String> {
     use serde_json::json;
 
-    let timestamp = Utc::now().format("%Y-%m-%d_%H-%M-%S").to_string();
+    let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
 
     // Create meeting folder if meeting name is provided
     let final_output_path = if let Some(name) = meeting_name {

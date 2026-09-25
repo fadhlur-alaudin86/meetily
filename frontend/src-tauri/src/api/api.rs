@@ -944,7 +944,12 @@ pub async fn rename_meeting_folder_on_disk_and_db(
         if !old_folder_str.trim().is_empty() {
             let old_folder_path = std::path::PathBuf::from(old_folder_str);
             if let Some(parent) = old_folder_path.parent() {
-                let date_prefix = meeting_metadata.created_at.0.format("%Y-%m-%d").to_string();
+                let date_prefix = meeting_metadata
+                    .created_at
+                    .0
+                    .with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d")
+                    .to_string();
                 let sanitized_title = crate::audio::audio_processing::sanitize_filename(new_title);
                 let new_folder_name = format!("{}_{}", date_prefix, sanitized_title);
                 let new_folder_path = parent.join(new_folder_name);
