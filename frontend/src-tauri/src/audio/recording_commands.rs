@@ -352,19 +352,36 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         "message": "Recording initialization started"
     })).map_err(|e| e.to_string())?;
 
-    // Load recording preferences to get auto_save AND device preferences
-    let (auto_save, preferred_mic_name, preferred_system_name) =
+    // Load recording preferences to get auto_save, device preferences, and custom save_folder
+    let (auto_save, preferred_mic_name, preferred_system_name, raw_save_folder) =
         match super::recording_preferences::load_recording_preferences(&app).await {
             Ok(prefs) => {
-                info!("📋 Loaded recording preferences: auto_save={}, preferred_mic={:?}, preferred_system={:?}",
-                      prefs.auto_save, prefs.preferred_mic_device, prefs.preferred_system_device);
-                (prefs.auto_save, prefs.preferred_mic_device, prefs.preferred_system_device)
+                info!("📋 Loaded recording preferences: auto_save={}, preferred_mic={:?}, preferred_system={:?}, save_folder={:?}",
+                      prefs.auto_save, prefs.preferred_mic_device, prefs.preferred_system_device, prefs.save_folder);
+                (prefs.auto_save, prefs.preferred_mic_device, prefs.preferred_system_device, Some(prefs.save_folder))
             }
             Err(e) => {
                 warn!("Failed to load recording preferences, using defaults: {}", e);
-                (true, None, None)
+                (true, None, None, None)
             }
         };
+
+    let default_folder = super::recording_preferences::get_default_recordings_folder();
+    let effective_save_folder = match raw_save_folder {
+        Some(custom) => {
+            if std::fs::create_dir_all(&custom).is_ok() {
+                custom
+            } else {
+                warn!("⚠️ Custom save folder {:?} is inaccessible, falling back to default {:?}", custom, default_folder);
+                let _ = app.emit("recording-folder-fallback", serde_json::json!({
+                    "message": "Custom recording folder is inaccessible. Saved to default location.",
+                    "default_folder": default_folder.to_string_lossy().to_string()
+                }));
+                default_folder
+            }
+        }
+        None => default_folder,
+    };
 
     #[cfg(not(target_os = "macos"))]
     let microphone_device = resolve_mic_or_default(&app, preferred_mic_name.as_deref());
@@ -382,6 +399,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
 
     // Create new recording manager only after startup validation succeeds
     let mut manager = RecordingManager::new();
+    manager.set_save_folder(Some(effective_save_folder));
 
     // Always ensure a meeting name is set so incremental saver initializes
     let effective_meeting_name = meeting_name.clone().unwrap_or_else(|| {
@@ -559,17 +577,35 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     // Create new recording manager
     let mut manager = RecordingManager::new();
 
-    // Load recording preferences to check auto_save setting
-    let auto_save = match super::recording_preferences::load_recording_preferences(&app).await {
+    // Load recording preferences to check auto_save and save_folder settings
+    let (auto_save, raw_save_folder) = match super::recording_preferences::load_recording_preferences(&app).await {
         Ok(prefs) => {
-            info!("📋 Loaded recording preferences: auto_save={}", prefs.auto_save);
-            prefs.auto_save
+            info!("📋 Loaded recording preferences: auto_save={}, save_folder={:?}", prefs.auto_save, prefs.save_folder);
+            (prefs.auto_save, Some(prefs.save_folder))
         }
         Err(e) => {
             warn!("Failed to load recording preferences, defaulting to auto_save=true: {}", e);
-            true // Default to saving if preferences can't be loaded
+            (true, None)
         }
     };
+
+    let default_folder = super::recording_preferences::get_default_recordings_folder();
+    let effective_save_folder = match raw_save_folder {
+        Some(custom) => {
+            if std::fs::create_dir_all(&custom).is_ok() {
+                custom
+            } else {
+                warn!("⚠️ Custom save folder {:?} is inaccessible, falling back to default {:?}", custom, default_folder);
+                let _ = app.emit("recording-folder-fallback", serde_json::json!({
+                    "message": "Custom recording folder is inaccessible. Saved to default location.",
+                    "default_folder": default_folder.to_string_lossy().to_string()
+                }));
+                default_folder
+            }
+        }
+        None => default_folder,
+    };
+    manager.set_save_folder(Some(effective_save_folder));
 
     // Always ensure a meeting name is set so incremental saver initializes
     let effective_meeting_name = meeting_name.clone().unwrap_or_else(|| {

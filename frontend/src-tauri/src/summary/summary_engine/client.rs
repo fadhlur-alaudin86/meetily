@@ -178,12 +178,27 @@ pub async fn generate_with_builtin(
         }
     }
 
+    // Estimate prompt tokens and dynamically size context to fit the prompt + max_tokens + headroom,
+    // bounded between 4096 and model_def.context_size.
+    // This prevents allocating an oversized KV cache on smaller VRAM cards while allowing full context when needed.
+    let estimated_prompt_tokens = (formatted_prompt.len() as f64 * 0.35).ceil() as usize;
+    let dynamic_context_size = (estimated_prompt_tokens + models::DEFAULT_MAX_TOKENS as usize + 1500)
+        .max(4096)
+        .min(model_def.context_size as usize) as u32;
+
+    log::info!(
+        "Estimated prompt tokens: {}, allocating dynamic context size: {} (model max: {})",
+        estimated_prompt_tokens,
+        dynamic_context_size,
+        model_def.context_size
+    );
+
     // Prepare generation request with model-specific sampling parameters
     let sampling = model_def.sampling.sanitize_for_llama_helper();
     let request = Request::Generate {
         prompt: formatted_prompt,
         max_tokens: Some(models::DEFAULT_MAX_TOKENS),
-        context_size: Some(model_def.context_size),
+        context_size: Some(dynamic_context_size),
         model_path: Some(model_path.to_string_lossy().to_string()),
         temperature: Some(sampling.temperature),
         top_k: Some(sampling.top_k),

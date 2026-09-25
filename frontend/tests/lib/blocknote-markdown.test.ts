@@ -8,7 +8,7 @@ describe("blocksToMarkdownSafely", () => {
 
   test("returns markdown when conversion succeeds", async () => {
     const editor = {
-      blocksToMarkdownLossy: mock(async () => "# Summary"),
+      blocksToMarkdownLossy: mock(() => "# Summary"),
     };
 
     const result = await blocksToMarkdownSafely(editor, [] as any, {
@@ -25,7 +25,7 @@ describe("blocksToMarkdownSafely", () => {
   test("returns fallback markdown when conversion throws", async () => {
     const error = new Error("conversion failed");
     const editor = {
-      blocksToMarkdownLossy: mock(async () => {
+      blocksToMarkdownLossy: mock(() => {
         throw error;
       }),
     };
@@ -54,7 +54,7 @@ describe("blocksToMarkdownSafely", () => {
 
   test("omits markdown when conversion throws without fallback", async () => {
     const editor = {
-      blocksToMarkdownLossy: mock(async () => {
+      blocksToMarkdownLossy: mock(() => {
         throw new Error("conversion failed");
       }),
     };

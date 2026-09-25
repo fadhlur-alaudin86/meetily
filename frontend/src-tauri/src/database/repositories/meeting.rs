@@ -228,6 +228,20 @@ impl MeetingsRepository {
         transaction.commit().await?;
         Ok(true)
     }
+
+    pub async fn update_meeting_folder_path(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        new_folder_path: &str,
+    ) -> Result<bool, SqlxError> {
+        let result = sqlx::query("UPDATE meetings SET folder_path = ?, updated_at = ? WHERE id = ?")
+            .bind(new_folder_path)
+            .bind(Utc::now().naive_utc())
+            .bind(meeting_id)
+            .execute(pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
 }
 
 async fn delete_meeting_with_transaction(

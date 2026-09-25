@@ -265,6 +265,60 @@ impl SummaryService {
         }
     }
 
+    /// Exports summary.json into the meeting folder on disk if available
+    async fn export_summary_to_meeting_folder(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        result_json: &serde_json::Value,
+        model_name: &str,
+        template_id: &str,
+    ) {
+        let meeting = match MeetingsRepository::get_meeting_metadata(pool, meeting_id).await {
+            Ok(Some(m)) => m,
+            Ok(None) => {
+                warn!("Meeting {} not found for summary export", meeting_id);
+                return;
+            }
+            Err(e) => {
+                warn!("Failed to get meeting metadata for summary export ({}): {}", meeting_id, e);
+                return;
+            }
+        };
+
+        let Some(folder_path_str) = meeting.folder_path.filter(|p| !p.trim().is_empty()) else {
+            info!("No folder_path found for meeting {}, skipping disk export of summary.json", meeting_id);
+            return;
+        };
+
+        let folder = std::path::PathBuf::from(&folder_path_str);
+        if !folder.exists() {
+            warn!("Meeting folder {:?} does not exist on disk, skipping summary export", folder);
+            return;
+        }
+
+        let summary_file = folder.join("summary.json");
+        let payload = serde_json::json!({
+            "meeting_id": meeting_id,
+            "title": meeting.title,
+            "created_at": meeting.created_at,
+            "model": model_name,
+            "template": template_id,
+            "exported_at": Utc::now().to_rfc3339(),
+            "summary": result_json,
+        });
+
+        match serde_json::to_string_pretty(&payload) {
+            Ok(json_str) => {
+                if let Err(e) = std::fs::write(&summary_file, json_str) {
+                    warn!("Failed to write summary.json to {:?}: {}", summary_file, e);
+                } else {
+                    info!("✅ Exported summary.json to {:?}", summary_file);
+                }
+            }
+            Err(e) => warn!("Failed to serialize summary.json payload: {}", e),
+        }
+    }
+
     async fn read_detected_summary_language(
         pool: &SqlitePool,
         meeting_id: &str,
@@ -343,11 +397,12 @@ impl SummaryService {
         custom_prompt: String,
         template_id: String,
         summary_language: Option<String>,
+        user_chunk_size: Option<i32>,
     ) {
         let start_time = Instant::now();
         info!(
-            "Starting background processing for meeting_id: {}",
-            meeting_id
+            "Starting background processing for meeting_id: {}, user_chunk_size: {:?}",
+            meeting_id, user_chunk_size
         );
 
         // Parse provider
@@ -435,18 +490,23 @@ impl SummaryService {
                 Ok(metadata) => {
                     // Reserve 300 tokens for prompt overhead
                     let optimal = metadata.context_size.saturating_sub(300);
+                    let target = user_chunk_size
+                        .map(|c| c as usize)
+                        .unwrap_or(optimal)
+                        .min(optimal);
                     info!(
                         "✓ Using dynamic context for {}: {} tokens (chunk size: {})",
-                        model_name, metadata.context_size, optimal
+                        model_name, metadata.context_size, target
                     );
-                    optimal
+                    target
                 }
                 Err(e) => {
+                    let fallback = user_chunk_size.map(|c| c as usize).unwrap_or(4000).min(4000);
                     warn!(
-                        "Failed to fetch context for {}: {}. Using default 4000",
-                        model_name, e
+                        "Failed to fetch context for {}: {}. Using threshold {}",
+                        model_name, e, fallback
                     );
-                    4000  // Fallback to safe default
+                    fallback
                 }
             }
         } else if provider == LLMProvider::BuiltInAI {
@@ -457,22 +517,26 @@ impl SummaryService {
 
             match model {
                 Ok(model_def) => {
-                    // Reserve 300 tokens for prompt overhead
-                    let optimal = model_def.context_size.saturating_sub(300) as usize;
+                    // Reserve prompt overhead + generation headroom (~1500 tokens)
+                    let max_safe = (model_def.context_size.saturating_sub(1500) as usize).max(1000);
+                    let target = user_chunk_size
+                        .map(|c| c as usize)
+                        .unwrap_or(3000)
+                        .min(max_safe);
                     info!(
-                        "✓ Using BuiltInAI context size: {} tokens (chunk size: {})",
-                        model_def.context_size, optimal
+                        "✓ Using BuiltInAI context size: {} tokens (effective chunk threshold: {})",
+                        model_def.context_size, target
                     );
-                    optimal
+                    target
                 }
                 Err(e) => {
                     warn!("{}, using default 2048", e);
-                    1748  // 2048 - 300 for overhead
+                    1748 // 2048 - 300 for overhead
                 }
             }
         } else {
             // Cloud providers (OpenAI, Claude, Groq, CustomOpenAI) handle large contexts automatically
-            100000  // Effectively unlimited for single-pass processing
+            user_chunk_size.map(|c| c as usize).unwrap_or(100000)
         };
 
         // Get app data directory for BuiltInAI provider
@@ -591,6 +655,7 @@ impl SummaryService {
                     }
                 };
 
+                let export_json = result_json.clone();
                 match SummaryProcessesRepository::update_process_completed(
                     &pool,
                     &meeting_id,
@@ -614,6 +679,16 @@ impl SummaryService {
                             }
                         }
                         info!("Summary saved successfully for meeting_id: {}", meeting_id);
+
+                        // Export summary.json to meeting folder on disk
+                        Self::export_summary_to_meeting_folder(
+                            &pool,
+                            &meeting_id,
+                            &export_json,
+                            &model_name,
+                            &template_id,
+                        )
+                        .await;
                     }
                     Ok(false) => warn!("Skipped stale summary completion for meeting_id: {}", meeting_id),
                     Err(error) => error!(

@@ -267,7 +267,116 @@ pub fn rough_token_count(s: &str) -> usize {
 /// * `overlap_tokens` - Number of overlapping tokens between chunks
 ///
 /// # Returns
-/// Vector of text chunks with smart word-boundary splitting
+/// Helper to find the end byte index of the last complete sentence in `slice`.
+/// Recognizes sentence terminators: '.', '!', '?', or paragraph breaks ('\n\n'),
+/// optionally followed by quotes or brackets and whitespace.
+fn find_last_sentence_boundary(slice: &str) -> Option<usize> {
+    let bytes = slice.as_bytes();
+    let len = bytes.len();
+    if len == 0 {
+        return None;
+    }
+
+    // Check if the entire slice ends with a terminator
+    if bytes[len - 1] == b'.' || bytes[len - 1] == b'!' || bytes[len - 1] == b'?' {
+        return Some(len);
+    }
+    if len >= 2 && (bytes[len - 1] == b'"' || bytes[len - 1] == b'\'' || bytes[len - 1] == b')' || bytes[len - 1] == b']') {
+        let prev = bytes[len - 2];
+        if prev == b'.' || prev == b'!' || prev == b'?' {
+            return Some(len);
+        }
+    }
+
+    // Search backwards for sentence terminators
+    for i in (1..len).rev() {
+        // Double newline (paragraph break)
+        if bytes[i] == b'\n' && bytes[i - 1] == b'\n' {
+            return Some(i + 1);
+        }
+        if i >= 2 && bytes[i] == b'\n' && bytes[i - 1] == b'\r' && bytes[i - 2] == b'\n' {
+            return Some(i + 1);
+        }
+
+        let b = bytes[i - 1];
+        if b == b'.' || b == b'!' || b == b'?' {
+            let next_b = bytes[i];
+            // Check whitespace immediately following punctuation
+            if next_b == b' ' || next_b == b'\n' || next_b == b'\r' || next_b == b'\t' {
+                return Some(i);
+            }
+            // Check quote/bracket followed by whitespace or end
+            if (next_b == b'"' || next_b == b'\'' || next_b == b')' || next_b == b']')
+                && (i + 1 == len || bytes[i + 1].is_ascii_whitespace())
+            {
+                return Some(i + 1);
+            }
+        }
+    }
+    None
+}
+
+/// Helper to find the byte offset within `slice_up_to_boundary` where the last sentence starts,
+/// so it can be carried over as 1-sentence overlap into the next chunk.
+fn find_last_sentence_start(slice_up_to_boundary: &str) -> Option<usize> {
+    let trimmed = slice_up_to_boundary.trim_end();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Search before the last character
+    let search_slice = &trimmed[..trimmed.len().saturating_sub(1)];
+    if let Some(prev_end) = find_last_sentence_boundary(search_slice) {
+        let mut start = prev_end;
+        while start < trimmed.len() && trimmed.as_bytes()[start].is_ascii_whitespace() {
+            start += 1;
+        }
+        if start < trimmed.len() && start > 0 {
+            return Some(start);
+        }
+    }
+    None
+}
+
+/// Helper to find a word-aligned start position within `emitted_slice` for overlap,
+/// ensuring we never slice in the middle of a word.
+fn find_word_aligned_overlap_char_offset(emitted_slice: &str, target_overlap_chars: usize) -> usize {
+    let total_chars = emitted_slice.chars().count();
+    if target_overlap_chars == 0 || total_chars <= target_overlap_chars {
+        return total_chars;
+    }
+
+    let target_char = total_chars.saturating_sub(target_overlap_chars);
+    let chars: Vec<char> = emitted_slice.chars().collect();
+
+    // Look backward from target_char for whitespace
+    let mut candidate = None;
+    for i in (0..=target_char).rev() {
+        if chars[i].is_whitespace() {
+            candidate = Some(i + 1);
+            break;
+        }
+    }
+
+    // If no whitespace found backward, look forward from target_char
+    if candidate.is_none() {
+        for i in target_char..total_chars {
+            if chars[i].is_whitespace() {
+                candidate = Some(i + 1);
+                break;
+            }
+        }
+    }
+
+    if let Some(pos) = candidate {
+        if pos > 0 && pos < total_chars {
+            return pos;
+        }
+    }
+
+    total_chars
+}
+
+/// Vector of text chunks with dynamic sentence-boundary splitting and sentence overlap
 pub fn chunk_text(text: &str, chunk_size_tokens: usize, overlap_tokens: usize) -> Vec<String> {
     info!(
         "Chunking text with token-based chunk_size: {} and overlap: {}",
@@ -298,39 +407,68 @@ pub fn chunk_text(text: &str, chunk_size_tokens: usize, overlap_tokens: usize) -
 
     while start_char < total_chars {
         let end_char = (start_char + chunk_size_chars).min(total_chars);
-        let mut emitted_end_char = end_char;
-
-        // Convert character indices to byte indices for string slicing
         let start_byte: usize = chars[..start_char].iter().map(|c| c.len_utf8()).sum();
-        let mut end_byte: usize = chars[..end_char].iter().map(|c| c.len_utf8()).sum();
+        let end_byte: usize = chars[..end_char].iter().map(|c| c.len_utf8()).sum();
 
-        // Try to break at sentence or word boundary for cleaner chunks
+        let mut actual_end_byte = end_byte;
+        let mut next_start_char = None;
+
         if end_char < total_chars {
             let slice = &text[start_byte..end_byte];
-            let sentence_boundary = slice.rfind(". ").map(|index| index + 2);
-            let word_boundary = slice.rfind(' ').map(|index| index + 1);
-            let boundary = sentence_boundary
-                .filter(|end| slice[..*end].chars().count() > overlap_chars)
-                .or_else(|| {
-                    word_boundary.filter(|end| slice[..*end].chars().count() > overlap_chars)
-                });
 
-            if let Some(boundary) = boundary {
-                end_byte = start_byte + boundary;
-                emitted_end_char = start_char + slice[..boundary].chars().count();
+            // Priority 1: Sentence boundary (. ! ? \n\n)
+            let min_boundary_chars = (chunk_size_chars / 3).max(1);
+            let sentence_boundary = find_last_sentence_boundary(slice).filter(|&end| {
+                slice[..end].chars().count() >= min_boundary_chars
+            });
+
+            if let Some(boundary_byte) = sentence_boundary {
+                actual_end_byte = start_byte + boundary_byte;
+                let chunk_slice = &text[start_byte..actual_end_byte];
+
+                // Kombinasi 2: Bawa 1 kalimat terakhir sebagai konteks overlap di chunk berikutnya
+                if let Some(last_sent_start_byte) = find_last_sentence_start(chunk_slice) {
+                    let overlap_start_char = start_char + chunk_slice[..last_sent_start_byte].chars().count();
+                    if overlap_start_char > start_char {
+                        next_start_char = Some(overlap_start_char);
+                    }
+                }
+                if next_start_char.is_none() {
+                    let emitted_chars = chunk_slice.chars().count();
+                    next_start_char = Some(start_char + emitted_chars);
+                }
+            } else {
+                // Priority 2 / Fallback (Kombinasi 3):
+                // Jika tidak ada batas kalimat dalam jendela chunk, potong di batas kata (spasi)
+                let word_boundary = slice.rfind(' ').map(|idx| idx + 1)
+                    .filter(|&end| slice[..end].chars().count() > overlap_chars);
+
+                if let Some(boundary_byte) = word_boundary {
+                    actual_end_byte = start_byte + boundary_byte;
+                    let emitted_slice = &slice[..boundary_byte];
+                    let offset = find_word_aligned_overlap_char_offset(emitted_slice, overlap_chars);
+                    next_start_char = Some((start_char + offset).max(start_char + 1));
+                } else {
+                    // Fallback darurat jika bahkan tidak ada spasi sama sekali
+                    actual_end_byte = end_byte;
+                    next_start_char = Some(
+                        end_char
+                            .saturating_sub(overlap_chars)
+                            .max(start_char + 1)
+                    );
+                }
             }
         }
 
-        // Extract chunk
-        chunks.push(text[start_byte..end_byte].to_string());
+        chunks.push(text[start_byte..actual_end_byte].to_string());
 
-        if emitted_end_char >= total_chars {
+        let actual_emitted_chars = text[..actual_end_byte].chars().count();
+        if actual_emitted_chars >= total_chars {
             break;
         }
 
-        start_char = emitted_end_char
-            .saturating_sub(overlap_chars)
-            .max(start_char + 1);
+        let next = next_start_char.unwrap_or(actual_emitted_chars);
+        start_char = next.max(start_char + 1);
     }
 
     info!("Created {} chunks from text", chunks.len());
@@ -916,5 +1054,23 @@ mod tests {
         assert_eq!(cleaned.markdown, markdown);
         assert!(!cleaned.reasoning_stripped);
         assert_eq!(clean_llm_markdown_detailed(markdown).markdown, markdown);
+    }
+
+    #[test]
+    fn chunk_text_splits_on_sentence_boundaries_with_overlap() {
+        let text = "Kalimat pertama selesai di sini. Kalimat kedua membahas tentang rencana sprint. Kalimat ketiga menyimpulkan diskusi.";
+        let chunks = chunk_text(text, 30, 10);
+        assert!(chunks.len() >= 2);
+        assert!(chunks[0].ends_with('.'));
+        assert!(chunks[0].contains("rencana sprint."));
+        assert!(chunks[1].contains("rencana sprint."));
+    }
+
+    #[test]
+    fn chunk_text_falls_back_to_words_when_no_punctuation() {
+        let text = "satu dua tiga empat lima enam tujuh delapan sembilan sepuluh sebelas dua belas";
+        let chunks = chunk_text(text, 5, 1);
+        assert!(chunks.len() >= 2);
+        assert!(chunks.iter().any(|c| c.contains("dua belas")));
     }
 }

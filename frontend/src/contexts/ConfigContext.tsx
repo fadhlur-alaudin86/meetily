@@ -21,6 +21,13 @@ export interface StorageLocations {
   recordings: string;
 }
 
+export interface GpuHardwareInfo {
+  detected_gpu: string;
+  total_vram_mb: number | null;
+  free_vram_mb: number | null;
+  recommended_chunk_size: number;
+}
+
 export interface NotificationSettings {
   recording_notifications: boolean;
   time_based_reminders: boolean;
@@ -76,6 +83,8 @@ interface ConfigContextType {
   // Summary configuration
   isAutoSummary: boolean;
   toggleIsAutoSummary: (checked: boolean) => void;
+  summaryChunkSize: number;
+  setSummaryChunkSize: (size: number) => void;
 
   // Provider-specific API keys
   providerApiKeys: {
@@ -166,6 +175,15 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     return false;
   });
 
+  const [summaryChunkSize, setSummaryChunkSizeState] = useState<number>(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('summaryChunkSize');
+      const parsed = saved ? parseInt(saved, 10) : NaN;
+      return !isNaN(parsed) ? parsed : 3000;
+    }
+    return 3000;
+  });
+
   // Beta features state (localStorage)
   const [betaFeatures, setBetaFeatures] = useState<BetaFeatures>(() => {
     return loadBetaFeatures();
@@ -177,6 +195,22 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
   const [isLoadingPreferences, setIsLoadingPreferences] = useState(false);
   const preferencesLoadedRef = useRef(false);
   const isLoadingRef = useRef(false);
+
+  // Auto-detect GPU hardware and set recommended chunk size on first run
+  useEffect(() => {
+    if (typeof window !== 'undefined' && localStorage.getItem('summaryChunkSize') === null) {
+      invoke<GpuHardwareInfo>('detect_gpu_hardware')
+        .then((gpuInfo) => {
+          if (gpuInfo?.recommended_chunk_size) {
+            setSummaryChunkSizeState(gpuInfo.recommended_chunk_size);
+            localStorage.setItem('summaryChunkSize', gpuInfo.recommended_chunk_size.toString());
+          }
+        })
+        .catch((err) => {
+          console.warn('Failed to auto-detect GPU hardware for chunk size:', err);
+        });
+    }
+  }, []);
 
   // Load Ollama models (uses saved endpoint, re-runs when endpoint changes after config load)
   useEffect(() => {
@@ -394,6 +428,13 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
+  const setSummaryChunkSize = useCallback((size: number) => {
+    setSummaryChunkSizeState(size);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('summaryChunkSize', size.toString());
+    }
+  }, []);
+
   // Toggle beta feature with localStorage persistence and analytics
   const toggleBetaFeature = useCallback((featureKey: BetaFeatureKey, enabled: boolean) => {
     setBetaFeatures(prev => {
@@ -493,6 +534,8 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     isModelConfigLoading,
     isAutoSummary,
     toggleIsAutoSummary,
+    summaryChunkSize,
+    setSummaryChunkSize,
     providerApiKeys,
     updateProviderApiKey,
     transcriptModelConfig,
@@ -518,6 +561,8 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     isModelConfigLoading,
     isAutoSummary,
     toggleIsAutoSummary,
+    summaryChunkSize,
+    setSummaryChunkSize,
     providerApiKeys,
     updateProviderApiKey,
     transcriptModelConfig,

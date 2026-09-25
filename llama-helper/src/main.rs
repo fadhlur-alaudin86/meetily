@@ -364,11 +364,12 @@ impl ModelState {
             })
             .unwrap_or(2);
 
+        let n_batch = self.context_size.min(512);
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(Some(
                 NonZeroU32::new(self.context_size).context("Invalid ctx size")?,
             ))
-            .with_n_batch(self.context_size)
+            .with_n_batch(n_batch)
             .with_n_threads(threads)
             .with_n_threads_batch(threads);
 
@@ -382,22 +383,29 @@ impl ModelState {
 
         eprintln!("📝 Tokenized prompt: {} tokens", tokens_list.len());
 
-        // Use context size for batch capacity to handle long prompts
-        let batch_size = self.context_size as usize;
+        // Process prompt in chunks of n_batch to keep memory footprint minimal
+        let batch_size = n_batch as usize;
         let mut batch = LlamaBatch::new(batch_size, 1);
 
-        let last_index: i32 = (tokens_list.len() - 1) as i32;
-        for (i, token) in (0_i32..).zip(tokens_list.into_iter()) {
-            let is_last = i == last_index;
-            batch
-                .add(token, i, &[0], is_last)
-                .context("Failed to add token to batch")?;
-        }
+        let total_tokens = tokens_list.len();
+        for (chunk_idx, token_chunk) in tokens_list.chunks(batch_size).enumerate() {
+            batch.clear();
+            let start_pos = (chunk_idx * batch_size) as i32;
+            let is_last_chunk = chunk_idx * batch_size + token_chunk.len() == total_tokens;
 
-        ctx.decode(&mut batch).context("llama_decode() failed")?;
+            for (i, &token) in token_chunk.iter().enumerate() {
+                let pos = start_pos + i as i32;
+                let is_last_token = is_last_chunk && (i == token_chunk.len() - 1);
+                batch
+                    .add(token, pos, &[0], is_last_token)
+                    .context("Failed to add token to batch")?;
+            }
+
+            ctx.decode(&mut batch).context("llama_decode() failed")?;
+        }
         let prompt_time = start_time.elapsed();
 
-        let n_prompt_tokens = batch.n_tokens();
+        let n_prompt_tokens = total_tokens as i32;
         let mut n_cur = n_prompt_tokens;
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut output = String::new();
@@ -414,6 +422,7 @@ impl ModelState {
             if sampling.uses_penalties() {
                 LlamaSampler::chain_simple([
                     LlamaSampler::penalties(
+                        model.n_vocab(),
                         sampling.penalty_last_n,
                         sampling.repeat_penalty,
                         sampling.frequency_penalty,
@@ -427,6 +436,7 @@ impl ModelState {
         } else if sampling.uses_penalties() {
             LlamaSampler::chain_simple([
                 LlamaSampler::penalties(
+                    model.n_vocab(),
                     sampling.penalty_last_n,
                     sampling.repeat_penalty,
                     sampling.frequency_penalty,

@@ -19,6 +19,24 @@ if [[ "$OSTYPE" == "linux-gnu"* ]]; then
     export CMAKE_CUDA_ARCHITECTURES=75
     export CMAKE_CUDA_STANDARD=17
     export CMAKE_POSITION_INDEPENDENT_CODE=ON
+
+    # AppImage / linuxdeploy workarounds for systems with VMware installed.
+    # linuxdeploy-plugin-gtk scans all LD_LIBRARY_PATH entries and picks up
+    # /usr/lib/vmware/lib/libgdk_pixbuf-2.0.so.0 which depends on
+    # libcroco-0.6.so.3 — a library that no longer exists on modern distros.
+    # Stripping VMware paths from the search scope prevents the fatal plugin error.
+    if [[ -d "/usr/lib/vmware" ]]; then
+        # Rebuild LD_LIBRARY_PATH excluding any VMware entries
+        CLEAN_LD_PATH=""
+        IFS=':' read -ra LDPATHS <<< "${LD_LIBRARY_PATH:-}"
+        for p in "${LDPATHS[@]}"; do
+            [[ "$p" != *"vmware"* ]] && CLEAN_LD_PATH="${CLEAN_LD_PATH:+$CLEAN_LD_PATH:}$p"
+        done
+        export LD_LIBRARY_PATH="$CLEAN_LD_PATH"
+    fi
+
+    # Use extraction mode so linuxdeploy AppImage doesn't need FUSE
+    export APPIMAGE_EXTRACT_AND_RUN=1
 fi
 
 # Detect OS

@@ -11,6 +11,7 @@ import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { invoke as invokeTauri } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import Analytics from '@/lib/analytics';
+import { useConfig } from '@/contexts/ConfigContext';
 
 import {
   detectAndCacheSummaryLanguage,
@@ -113,6 +114,7 @@ export function useSummaryGeneration({
     finished: boolean;
   } | null>(null);
   const { startSummaryPolling, stopSummaryPolling } = useSidebar();
+  const { summaryChunkSize } = useConfig();
 
   const getSummaryStatusMessage = useCallback((status: SummaryStatus) => {
     switch (status) {
@@ -366,7 +368,7 @@ export function useSummaryGeneration({
         model: modelConfig.provider,
         modelName: modelConfig.model,
         meetingId: meeting.id,
-        chunkSize: 40000,
+        chunkSize: summaryChunkSize || 3000,
         overlap: 1000,
         customPrompt,
         templateId: selectedTemplate,
@@ -395,6 +397,7 @@ export function useSummaryGeneration({
     selectedTemplate,
     setAiSummary,
     startSummaryPolling,
+    summaryChunkSize,
     updateMeetingTitle,
   ]);
 

@@ -245,13 +245,71 @@ pub async fn open_recordings_folder<R: Runtime>(app: AppHandle<R>) -> Result<(),
 
 #[tauri::command]
 pub async fn select_recording_folder<R: Runtime>(
-    _app: AppHandle<R>,
+    app: AppHandle<R>,
 ) -> Result<Option<String>, String> {
-    // Use Tauri's dialog to select folder
-    // For now, return None - this would need to be implemented with tauri-plugin-dialog
-    // when it's available in the Cargo.toml
-    warn!("Folder selection not yet implemented - using dialog plugin");
-    Ok(None)
+    use tauri_plugin_dialog::DialogExt;
+
+    info!("Opening dialog to select custom recordings folder");
+
+    let folder_path = app
+        .dialog()
+        .file()
+        .blocking_pick_folder();
+
+    if let Some(path) = folder_path {
+        let path_str = path.to_string();
+        info!("User selected custom recording folder: {}", path_str);
+
+        // Update preferences.save_folder in store immediately
+        if let Ok(mut prefs) = load_recording_preferences(&app).await {
+            prefs.save_folder = PathBuf::from(&path_str);
+            if let Err(e) = save_recording_preferences(&app, &prefs).await {
+                warn!("Failed to persist updated save_folder to store: {}", e);
+            }
+        }
+
+        Ok(Some(path_str))
+    } else {
+        info!("User cancelled folder selection");
+        Ok(None)
+    }
+}
+
+/// Reset recording folder to platform default
+#[tauri::command]
+pub async fn reset_recording_folder_to_default<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<String, String> {
+    let default_folder = get_default_recordings_folder();
+    let default_str = default_folder.to_string_lossy().to_string();
+
+    if let Ok(mut prefs) = load_recording_preferences(&app).await {
+        prefs.save_folder = default_folder;
+        if let Err(e) = save_recording_preferences(&app, &prefs).await {
+            warn!("Failed to persist reset save_folder to store: {}", e);
+        }
+    }
+
+    info!("Reset recording folder to default: {}", default_str);
+    Ok(default_str)
+}
+
+/// Get effective recordings folder (custom if accessible, else default)
+#[tauri::command]
+pub async fn get_effective_recordings_folder<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<String, String> {
+    let prefs = load_recording_preferences(&app)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let folder = if prefs.save_folder.exists() {
+        prefs.save_folder
+    } else {
+        get_default_recordings_folder()
+    };
+
+    Ok(folder.to_string_lossy().to_string())
 }
 
 // Backend selection commands

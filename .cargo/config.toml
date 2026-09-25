@@ -1,0 +1,6 @@
+[env]
+# Force whisper-rs-sys to use its pre-generated bindings.rs instead of running
+# bindgen at build time. Runtime bindgen with newer clang/libclang versions can
+# produce broken bindings for whisper.cpp 1.7.1 (whisper_full_params becomes an
+# opaque struct with only _address field). The bundled src/bindings.rs is correct.
+WHISPER_DONT_GENERATE_BINDINGS = "1"

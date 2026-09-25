@@ -49,10 +49,17 @@ if (platform === 'linux' && feature === 'cuda') {
 
 // Build the tauri command
 let tauriCmd = `tauri ${command}`;
+
+// On Linux, restrict to deb only: AppImage bundling fails when linuxdeploy-plugin-gtk
+// resolves libgdk_pixbuf from VMware's lib path (/usr/lib/vmware/lib/) which depends
+// on libcroco-0.6.so.3 — absent on modern distros. deb is the primary Linux artifact.
+const bundleArgs = (platform === 'linux' && command === 'build') ? ' --bundles deb' : '';
+
 if (feature && feature !== 'none') {
-  tauriCmd += ` -- --features ${feature}`;
+  tauriCmd += `${bundleArgs} -- --features ${feature}`;
   console.log(`🚀 Running: tauri ${command} with features: ${feature}`);
 } else {
+  tauriCmd += bundleArgs;
   console.log(`🚀 Running: tauri ${command} (CPU-only mode)`);
 }
 console.log('');

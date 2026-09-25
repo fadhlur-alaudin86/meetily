@@ -1,6 +1,103 @@
 use std::path::Path;
 use std::sync::OnceLock;
 use log::info;
+use serde::{Deserialize, Serialize};
+
+/// Detected GPU and VRAM information for smart default configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpuHardwareInfo {
+    pub name: String,
+    pub vram_mb: Option<u64>,
+    pub gpu_type: String,
+    pub recommended_chunk_size: usize,
+}
+
+#[tauri::command]
+pub fn detect_gpu_hardware() -> GpuHardwareInfo {
+    // 1. Try NVIDIA CUDA via nvidia-smi
+    if let Ok(output) = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=name,memory.total", "--format=csv,noheader,nounits"])
+        .output()
+    {
+        if let Ok(stdout) = String::from_utf8(output.stdout) {
+            let line = stdout.lines().next().unwrap_or("").trim();
+            if !line.is_empty() {
+                let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+                let name = parts.first().unwrap_or(&"NVIDIA GPU").to_string();
+                let vram_mb = parts.get(1).and_then(|v| v.parse::<u64>().ok());
+                let rec = match vram_mb {
+                    Some(mb) if mb <= 4096 => 3000,
+                    Some(mb) if mb <= 8192 => 8000,
+                    Some(mb) if mb <= 16384 => 16000,
+                    Some(_) => 32000,
+                    None => 3000,
+                };
+                return GpuHardwareInfo {
+                    name,
+                    vram_mb,
+                    gpu_type: "CUDA".to_string(),
+                    recommended_chunk_size: rec,
+                };
+            }
+        }
+    }
+
+    // 2. Try macOS Apple Silicon via sysctl
+    #[cfg(target_os = "macos")]
+    {
+        if std::env::consts::ARCH == "aarch64" {
+            if let Ok(output) = std::process::Command::new("sysctl").arg("hw.memsize").output() {
+                if let Ok(stdout) = String::from_utf8(output.stdout) {
+                    if let Some(bytes_str) = stdout.split(':').nth(1) {
+                        if let Ok(bytes) = bytes_str.trim().parse::<u64>() {
+                            let total_mb = bytes / (1024 * 1024);
+                            let rec = match total_mb {
+                                mb if mb <= 8192 => 4000,
+                                mb if mb <= 16384 => 12000,
+                                mb if mb <= 36864 => 24000,
+                                _ => 32000,
+                            };
+                            return GpuHardwareInfo {
+                                name: "Apple Silicon GPU (Unified)".to_string(),
+                                vram_mb: Some(total_mb),
+                                gpu_type: "Metal".to_string(),
+                                recommended_chunk_size: rec,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Vulkan or CPU fallback
+    let profile = HardwareProfile::detect();
+    let gpu_type_str = match profile.gpu_type {
+        GpuType::Vulkan => "Vulkan",
+        GpuType::Cuda => "CUDA",
+        GpuType::Metal => "Metal",
+        GpuType::OpenCL => "OpenCL",
+        GpuType::None => "CPU",
+    };
+
+    let rec = match profile.performance_tier {
+        PerformanceTier::Ultra => 24000,
+        PerformanceTier::High => 12000,
+        PerformanceTier::Medium => 6000,
+        PerformanceTier::Low => 2500,
+    };
+
+    GpuHardwareInfo {
+        name: if profile.has_gpu_acceleration {
+            format!("{} GPU", gpu_type_str)
+        } else {
+            "CPU (No Dedicated GPU)".to_string()
+        },
+        vram_mb: None,
+        gpu_type: gpu_type_str.to_string(),
+        recommended_chunk_size: rec,
+    }
+}
 
 /// Hardware capabilities for audio processing optimization
 #[derive(Debug, Clone, PartialEq)]

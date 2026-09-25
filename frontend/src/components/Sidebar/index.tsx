@@ -318,16 +318,14 @@ const Sidebar: React.FC = () => {
   }, [sidebarItems, searchQuery, searchResults, expandedFolders]);
 
 
-  const handleDelete = async (itemId: string) => {
-    console.log('Deleting item:', itemId);
-    const payload = {
-      meetingId: itemId
-    };
+  const handleDelete = async (itemId: string, deleteFiles: boolean = false) => {
+    console.log('Deleting item:', itemId, 'deleteFiles:', deleteFiles);
 
     try {
       const { invoke } = await import('@tauri-apps/api/core');
       await invoke('api_delete_meeting', {
         meetingId: itemId,
+        deleteFiles,
       });
       console.log('Meeting deleted successfully');
       const updatedMeetings = meetings.filter((m: CurrentMeeting) => m.id !== itemId);
@@ -338,7 +336,9 @@ const Sidebar: React.FC = () => {
 
       // Show success toast
       toast.success("Meeting deleted successfully", {
-        description: "All associated data has been removed"
+        description: deleteFiles
+          ? "Meeting and associated files on disk have been removed"
+          : "Meeting removed from app database (disk files kept)",
       });
 
       // If deleting the active meeting, navigate to home
@@ -354,9 +354,9 @@ const Sidebar: React.FC = () => {
     }
   };
 
-  const handleDeleteConfirm = () => {
+  const handleDeleteConfirm = (deleteFiles?: boolean) => {
     if (deleteModalState.itemId) {
-      handleDelete(deleteModalState.itemId);
+      handleDelete(deleteModalState.itemId, !!deleteFiles);
     }
     setDeleteModalState({ isOpen: false, itemId: null });
   };
@@ -821,6 +821,7 @@ const Sidebar: React.FC = () => {
       <ConfirmationModal
         isOpen={deleteModalState.isOpen}
         text="Are you sure you want to delete this meeting? This action cannot be undone."
+        showDeleteFilesOption={true}
         onConfirm={handleDeleteConfirm}
         onCancel={() => setDeleteModalState({ isOpen: false, itemId: null })}
       />

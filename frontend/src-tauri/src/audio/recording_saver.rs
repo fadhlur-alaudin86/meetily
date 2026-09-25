@@ -48,6 +48,7 @@ pub struct DeviceInfo {
 
 /// New recording saver using incremental saving strategy
 pub struct RecordingSaver {
+    save_folder: Option<PathBuf>,
     incremental_saver: Option<Arc<AsyncMutex<IncrementalAudioSaver>>>,
     meeting_folder: Option<PathBuf>,
     meeting_name: Option<String>,
@@ -59,6 +60,7 @@ pub struct RecordingSaver {
 impl RecordingSaver {
     pub fn new() -> Self {
         Self {
+            save_folder: None,
             incremental_saver: None,
             meeting_folder: None,
             meeting_name: None,
@@ -66,6 +68,11 @@ impl RecordingSaver {
             transcript_segments: Arc::new(Mutex::new(Vec::new())),
             is_saving: Arc::new(Mutex::new(false)),
         }
+    }
+
+    /// Set the custom save folder for this recording session
+    pub fn set_save_folder(&mut self, folder: Option<PathBuf>) {
+        self.save_folder = folder;
     }
 
     /// Set the meeting name for this recording session
@@ -222,8 +229,11 @@ impl RecordingSaver {
     /// * `meeting_name` - Name of the meeting
     /// * `create_checkpoints` - Whether to create .checkpoints/ directory and IncrementalAudioSaver
     fn initialize_meeting_folder(&mut self, meeting_name: &str, create_checkpoints: bool) -> Result<()> {
-        // Load preferences to get base recordings folder
-        let base_folder = super::recording_preferences::get_default_recordings_folder();
+        // Use configured custom save folder if set, otherwise fallback to default
+        let base_folder = self
+            .save_folder
+            .clone()
+            .unwrap_or_else(super::recording_preferences::get_default_recordings_folder);
 
         // Create meeting folder structure (with or without .checkpoints/ subdirectory)
         let meeting_folder = create_meeting_folder(&base_folder, meeting_name, create_checkpoints)?;

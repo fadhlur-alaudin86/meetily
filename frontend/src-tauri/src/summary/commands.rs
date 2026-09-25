@@ -539,6 +539,7 @@ pub async fn api_process_transcript<R: Runtime>(
             final_prompt,
             final_template_id,
             summary_language,
+            _chunk_size,
         )
         .await;
     });
