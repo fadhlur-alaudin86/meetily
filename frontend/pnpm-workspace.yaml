@@ -12,3 +12,11 @@ minimumReleaseAgeExclude:
   - '@next/swc-win32-arm64-msvc@16.3.6'
   - '@next/swc-win32-x64-msvc@16.3.6'
   - next@16.3.6
+
+overrides:
+  prosemirror-model: 1.25.11
+  prosemirror-state: 1.4.4
+  prosemirror-view: 1.42.4
+  prosemirror-transform: 1.12.1
+  prosemirror-tables: 1.8.5
+

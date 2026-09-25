@@ -671,6 +671,10 @@ impl SummaryService {
                             extract_meeting_name_from_markdown(&generated.final_markdown)
                                 .filter(|name| !name.is_empty())
                         {
+                            // 1. Rename folder on disk to {YYYY-MM-DD}_{Sanitized_New_Title} and update folder_path in DB
+                            crate::api::rename_meeting_folder_on_disk_and_db(&pool, &meeting_id, &name).await;
+
+                            // 2. Update meeting name in database
                             if let Err(error) =
                                 MeetingsRepository::update_meeting_name(&pool, &meeting_id, &name)
                                     .await

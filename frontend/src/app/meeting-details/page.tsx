@@ -151,16 +151,22 @@ function MeetingDetailsContent() {
     }
   }, [transcriptError]);
 
-  // Extract fetchMeetingDetails for use in child components (now refetches via hook)
+  // Extract fetchMeetingDetails for use in child components (refetches metadata, transcripts, and summary)
   const fetchMeetingDetails = useCallback(async () => {
     if (!meetingId || meetingId === 'intro-call') {
       return;
     }
 
-    // The usePaginatedTranscripts hook automatically refetches when meetingId changes
-    // This function is kept for compatibility with onMeetingUpdated callback
-    console.log('fetchMeetingDetails called - pagination hook will handle refetch');
-  }, [meetingId]);
+    try {
+      await refetch();
+      const response = await invoke<SummaryProcessResponse>('api_get_summary', { meetingId });
+      setSummaryResponse(response);
+      const summary = parseSummaryContent(response.data);
+      setMeetingSummary(response.status === 'idle' ? null : summary);
+    } catch (e) {
+      console.error('Failed to refetch meeting details and summary:', e);
+    }
+  }, [meetingId, refetch]);
 
   // Reset states when meetingId changes (prevent race conditions)
   useEffect(() => {

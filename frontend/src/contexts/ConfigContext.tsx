@@ -24,7 +24,7 @@ export interface StorageLocations {
 export interface GpuHardwareInfo {
   detected_gpu: string;
   total_vram_mb: number | null;
-  free_vram_mb: number | null;
+  gpu_type: string;
   recommended_chunk_size: number;
 }
 

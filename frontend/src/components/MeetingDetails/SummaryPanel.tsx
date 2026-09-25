@@ -2,6 +2,9 @@
 
 import { MeetingSummary, Summary, Transcript } from '@/types';
 import { BlockNoteSummaryView, BlockNoteSummaryViewRef } from '@/components/AISummary/BlockNoteSummaryView';
+import { ErrorBoundary } from '@/components/ErrorBoundary';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { EmptyStateSummary } from '@/components/EmptyStateSummary';
 import { ModelConfig } from '@/components/ModelSettingsModal';
 import { SummaryGeneratorButtonGroup } from './SummaryGeneratorButtonGroup';
@@ -296,24 +299,48 @@ export function SummaryPanel({
       ) : (
         <div className="flex-1 overflow-y-auto overflow-x-auto min-h-0">
           <div className="p-6 w-full">
-            <BlockNoteSummaryView
-              ref={summaryRef}
-              summaryData={aiSummary}
-              onSave={onSaveSummary}
-              onSummaryChange={onSummaryChange}
-              onDirtyChange={onDirtyChange}
-              status={summaryStatus}
-              error={summaryError}
-              onRegenerateSummary={() => {
-                Analytics.trackButtonClick('regenerate_summary', 'meeting_details');
-                onRegenerateSummary();
-              }}
-              meeting={{
-                id: meeting.id,
-                title: meetingTitle,
-                created_at: meeting.created_at
-              }}
-            />
+            {(() => {
+              const fallbackMarkdown = (aiSummary && typeof aiSummary === 'object' && 'markdown' in aiSummary && typeof aiSummary.markdown === 'string')
+                ? aiSummary.markdown
+                : null;
+
+              return (
+                <ErrorBoundary
+                  title="Failed to render summary editor"
+                  fallback={
+                    fallbackMarkdown ? (
+                      <div className="flex flex-col gap-3 p-4 bg-white border border-gray-200 rounded-lg">
+                        <div className="p-2.5 bg-amber-50 border border-amber-200 rounded text-xs text-amber-800 flex items-center justify-between">
+                          <span>Editor rendering issue detected. Showing standard Markdown view.</span>
+                        </div>
+                        <div className="prose prose-sm max-w-none text-gray-800">
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>{fallbackMarkdown}</ReactMarkdown>
+                        </div>
+                      </div>
+                    ) : undefined
+                  }
+                >
+                  <BlockNoteSummaryView
+                    ref={summaryRef}
+                    summaryData={aiSummary}
+                    onSave={onSaveSummary}
+                    onSummaryChange={onSummaryChange}
+                    onDirtyChange={onDirtyChange}
+                    status={summaryStatus}
+                    error={summaryError}
+                    onRegenerateSummary={() => {
+                      Analytics.trackButtonClick('regenerate_summary', 'meeting_details');
+                      onRegenerateSummary();
+                    }}
+                    meeting={{
+                      id: meeting.id,
+                      title: meetingTitle,
+                      created_at: meeting.created_at
+                    }}
+                  />
+                </ErrorBoundary>
+              );
+            })()}
           </div>
           {summaryStatus !== 'idle' && (
             <div className={`mt-4 p-4 rounded-lg ${summaryStatus === 'error' ? 'bg-red-100 text-red-700' :

@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 /// Detected GPU and VRAM information for smart default configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuHardwareInfo {
-    pub name: String,
-    pub vram_mb: Option<u64>,
+    pub detected_gpu: String,
+    pub total_vram_mb: Option<u64>,
     pub gpu_type: String,
     pub recommended_chunk_size: usize,
 }
@@ -33,8 +33,8 @@ pub fn detect_gpu_hardware() -> GpuHardwareInfo {
                     None => 3000,
                 };
                 return GpuHardwareInfo {
-                    name,
-                    vram_mb,
+                    detected_gpu: name,
+                    total_vram_mb: vram_mb,
                     gpu_type: "CUDA".to_string(),
                     recommended_chunk_size: rec,
                 };
@@ -58,8 +58,8 @@ pub fn detect_gpu_hardware() -> GpuHardwareInfo {
                                 _ => 32000,
                             };
                             return GpuHardwareInfo {
-                                name: "Apple Silicon GPU (Unified)".to_string(),
-                                vram_mb: Some(total_mb),
+                                detected_gpu: "Apple Silicon GPU (Unified)".to_string(),
+                                total_vram_mb: Some(total_mb),
                                 gpu_type: "Metal".to_string(),
                                 recommended_chunk_size: rec,
                             };
@@ -88,12 +88,12 @@ pub fn detect_gpu_hardware() -> GpuHardwareInfo {
     };
 
     GpuHardwareInfo {
-        name: if profile.has_gpu_acceleration {
+        detected_gpu: if profile.has_gpu_acceleration {
             format!("{} GPU", gpu_type_str)
         } else {
             "CPU (No Dedicated GPU)".to_string()
         },
-        vram_mb: None,
+        total_vram_mb: None,
         gpu_type: gpu_type_str.to_string(),
         recommended_chunk_size: rec,
     }
@@ -419,5 +419,13 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
 
         assert!(!HardwareProfile::has_windows_vulkan_loader(temp_dir.path()));
+    }
+
+    #[test]
+    fn test_detect_gpu_hardware() {
+        let info = detect_gpu_hardware();
+        assert!(!info.detected_gpu.is_empty());
+        assert!(!info.gpu_type.is_empty());
+        assert!(info.recommended_chunk_size >= 1000 && info.recommended_chunk_size <= 32768);
     }
 }

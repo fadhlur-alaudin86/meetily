@@ -920,6 +920,110 @@ pub async fn api_get_meeting_transcripts<R: Runtime>(
     }
 }
 
+/// Renames meeting subfolder on disk to `{YYYY-MM-DD}_{Sanitized_New_Title}`
+/// and updates `meetings.folder_path` in SQLite.
+/// Also handles self-healing if folder was already renamed on disk.
+pub async fn rename_meeting_folder_on_disk_and_db(
+    pool: &sqlx::SqlitePool,
+    meeting_id: &str,
+    new_title: &str,
+) -> Option<std::path::PathBuf> {
+    let meeting_metadata = match MeetingsRepository::get_meeting_metadata(pool, meeting_id).await {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            log_warn!("No meeting found with id {} for folder rename", meeting_id);
+            return None;
+        }
+        Err(e) => {
+            log_warn!("Database error fetching meeting metadata for folder rename: {}", e);
+            return None;
+        }
+    };
+
+    if let Some(ref old_folder_str) = meeting_metadata.folder_path {
+        if !old_folder_str.trim().is_empty() {
+            let old_folder_path = std::path::PathBuf::from(old_folder_str);
+            if let Some(parent) = old_folder_path.parent() {
+                let date_prefix = meeting_metadata.created_at.0.format("%Y-%m-%d").to_string();
+                let sanitized_title = crate::audio::audio_processing::sanitize_filename(new_title);
+                let new_folder_name = format!("{}_{}", date_prefix, sanitized_title);
+                let new_folder_path = parent.join(new_folder_name);
+                let new_path_str = new_folder_path.to_string_lossy().to_string();
+
+                if new_folder_path == old_folder_path {
+                    return Some(old_folder_path);
+                }
+
+                if old_folder_path.exists() && old_folder_path.is_dir() {
+                    match std::fs::rename(&old_folder_path, &new_folder_path) {
+                        Ok(_) => {
+                            log_info!(
+                                "Successfully renamed meeting folder on disk from {} to {}",
+                                old_folder_path.display(),
+                                new_folder_path.display()
+                            );
+                            if let Err(e) = MeetingsRepository::update_meeting_folder_path(
+                                pool,
+                                meeting_id,
+                                &new_path_str,
+                            )
+                            .await
+                            {
+                                log_warn!("Failed to update meeting folder_path in db: {}", e);
+                            }
+
+                            // Also update summary.json title if present
+                            let summary_json_path = new_folder_path.join("summary.json");
+                            if summary_json_path.exists() {
+                                if let Ok(content) = std::fs::read_to_string(&summary_json_path) {
+                                    if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&content) {
+                                        if let Some(obj) = val.as_object_mut() {
+                                            obj.insert(
+                                                "title".to_string(),
+                                                serde_json::Value::String(new_title.to_string()),
+                                            );
+                                            if let Ok(updated_json) = serde_json::to_string_pretty(&val) {
+                                                let _ = std::fs::write(&summary_json_path, updated_json);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            return Some(new_folder_path);
+                        }
+                        Err(e) => {
+                            log_warn!(
+                                "Could not rename meeting folder on disk from {} to {}: {}",
+                                old_folder_path.display(),
+                                new_folder_path.display(),
+                                e
+                            );
+                        }
+                    }
+                } else if new_folder_path.exists() && new_folder_path.is_dir() {
+                    // Folder was already renamed on disk manually by user or another process: heal db!
+                    log_info!(
+                        "Meeting folder already renamed on disk at {}, updating db folder_path",
+                        new_folder_path.display()
+                    );
+                    if let Err(e) = MeetingsRepository::update_meeting_folder_path(
+                        pool,
+                        meeting_id,
+                        &new_path_str,
+                    )
+                    .await
+                    {
+                        log_warn!("Failed to update meeting folder_path in db: {}", e);
+                    }
+                    return Some(new_folder_path);
+                }
+            }
+        }
+    }
+    None
+}
+
 #[tauri::command]
 pub async fn api_save_meeting_title<R: Runtime>(
     _app: AppHandle<R>,
@@ -936,80 +1040,10 @@ pub async fn api_save_meeting_title<R: Runtime>(
     );
     let pool = state.db_manager.pool();
 
-    // 1. Fetch meeting metadata to check if folder_path exists
-    let meeting_metadata = MeetingsRepository::get_meeting_metadata(pool, &meeting_id)
-        .await
-        .map_err(|e| format!("Database error fetching meeting: {}", e))?;
+    // 1. Rename folder on disk if needed
+    rename_meeting_folder_on_disk_and_db(pool, &meeting_id, &title).await;
 
-    let Some(meeting) = meeting_metadata else {
-        log_error!("No meeting found with id {}", meeting_id);
-        return Err(format!("No meeting found with id {}", meeting_id));
-    };
-
-    // 2. If folder_path exists, rename the subfolder on disk to {YYYY-MM-DD}_{New_Title}
-    if let Some(ref old_folder_str) = meeting.folder_path {
-        if !old_folder_str.trim().is_empty() {
-            let old_folder_path = std::path::PathBuf::from(old_folder_str);
-            if old_folder_path.exists() && old_folder_path.is_dir() {
-                if let Some(parent) = old_folder_path.parent() {
-                    let date_prefix = meeting.created_at.0.format("%Y-%m-%d").to_string();
-                    let sanitized_title = crate::audio::audio_processing::sanitize_filename(&title);
-                    let new_folder_name = format!("{}_{}", date_prefix, sanitized_title);
-                    let new_folder_path = parent.join(new_folder_name);
-
-                    if new_folder_path != old_folder_path {
-                        match std::fs::rename(&old_folder_path, &new_folder_path) {
-                            Ok(_) => {
-                                log_info!(
-                                    "Successfully renamed meeting folder on disk from {} to {}",
-                                    old_folder_path.display(),
-                                    new_folder_path.display()
-                                );
-                                let new_path_str = new_folder_path.to_string_lossy().to_string();
-                                if let Err(e) = MeetingsRepository::update_meeting_folder_path(
-                                    pool,
-                                    &meeting_id,
-                                    &new_path_str,
-                                )
-                                .await
-                                {
-                                    log_warn!("Failed to update meeting folder_path in db: {}", e);
-                                }
-
-                                // Also update summary.json title if present
-                                let summary_json_path = new_folder_path.join("summary.json");
-                                if summary_json_path.exists() {
-                                    if let Ok(content) = std::fs::read_to_string(&summary_json_path) {
-                                        if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&content) {
-                                            if let Some(obj) = val.as_object_mut() {
-                                                obj.insert(
-                                                    "title".to_string(),
-                                                    serde_json::Value::String(title.clone()),
-                                                );
-                                                if let Ok(updated_json) = serde_json::to_string_pretty(&val) {
-                                                    let _ = std::fs::write(&summary_json_path, updated_json);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                log_warn!(
-                                    "Could not rename meeting folder on disk from {} to {}: {}",
-                                    old_folder_path.display(),
-                                    new_folder_path.display(),
-                                    e
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 3. Update meeting title in database
+    // 2. Update meeting title in database
     match MeetingsRepository::update_meeting_title(pool, &meeting_id, &title).await {
         Ok(true) => {
             log_info!("Successfully saved meeting title");
