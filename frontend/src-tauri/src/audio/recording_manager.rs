@@ -237,6 +237,9 @@ impl RecordingManager {
         let (transcription_sender, transcription_receiver) = mpsc::unbounded_channel::<AudioChunk>();
         let (recording_sender, recording_receiver) = mpsc::unbounded_channel::<AudioChunk>();
 
+        // Reset live system diarizer state for new recording session
+        crate::audio::diarization::reset_live_system_diarizer();
+
         // Start recording state first
         self.state.start_recording()?;
 
@@ -258,13 +261,23 @@ impl RecordingManager {
             ("No System Audio".to_string(), super::device_detection::InputDeviceKind::Unknown)
         };
 
+        // Adaptive VAD redemption time: 500ms when system audio is active (meetings, video calls, continuous speech),
+        // 1500ms when mic-only (allows natural pauses between phrases without fragmenting Whisper chunks)
+        let vad_redemption_time_ms = if system_device.is_some() {
+            super::pipeline::VAD_REDEMPTION_TIME_SYSTEM_MS
+        } else {
+            super::pipeline::VAD_REDEMPTION_TIME_MIC_ONLY_MS
+        };
+        info!("🎤 Setting adaptive VAD redemption time: {}ms (system audio active: {})",
+              vad_redemption_time_ms, system_device.is_some());
+
         // Start the audio processing pipeline with FFmpeg adaptive mixer
         // Pipeline will: 1) Mix mic+system audio with adaptive buffering, 2) Send mixed to recording_sender,
         // 3) Apply VAD and send speech segments to transcription
         if let Err(error) = self.pipeline_manager.start(
             self.state.clone(),
             transcription_sender,
-            0, // Ignored - using dynamic sizing internally
+            vad_redemption_time_ms,
             48000, // 48kHz sample rate
             Some(recording_sender), // CRITICAL: Pass recording sender to receive pre-mixed audio
             mic_name,
@@ -328,6 +341,7 @@ impl RecordingManager {
         }
 
         debug!("Recording streams stopped successfully");
+        crate::audio::diarization::reset_live_system_diarizer();
         Ok(())
     }
 
@@ -359,6 +373,9 @@ impl RecordingManager {
         // CRITICAL: Full cleanup to release all Arc references and resources
         // This ensures microphone is released even if Drop is delayed
         self.state.cleanup();
+
+        // Reset live system diarizer state
+        crate::audio::diarization::reset_live_system_diarizer();
 
         info!("✅ Recording streams stopped with immediate flush completed");
         Ok(())

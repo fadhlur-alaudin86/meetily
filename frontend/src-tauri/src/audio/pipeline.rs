@@ -24,7 +24,9 @@ use super::vad::{ContinuousVadProcessor};
 /// indefinitely, withholds live transcript emission, and overruns the
 /// accumulated-speech-buffer warning threshold. Bounded live segmentation
 /// during continuous speech is tracked separately in #756.
-const VAD_REDEMPTION_TIME_MS: u32 = 500;
+pub const VAD_REDEMPTION_TIME_MIC_ONLY_MS: u32 = 1500;
+pub const VAD_REDEMPTION_TIME_SYSTEM_MS: u32 = 500;
+pub const VAD_REDEMPTION_TIME_MS: u32 = 500;
 
 /// Ring buffer for synchronized audio mixing
 /// Accumulates samples from mic and system streams until we have aligned windows
@@ -714,7 +716,7 @@ impl AudioPipeline {
         receiver: mpsc::UnboundedReceiver<AudioChunk>,
         transcription_sender: mpsc::UnboundedSender<AudioChunk>,
         state: Arc<RecordingState>,
-        target_chunk_duration_ms: u32,
+        vad_redemption_time_ms: u32,
         sample_rate: u32,
         mic_device_name: String,
         mic_device_kind: super::device_detection::InputDeviceKind,
@@ -740,34 +742,22 @@ impl AudioPipeline {
         // engine are. Conversational speech pauses constantly for breath and
         // mid-sentence thought, and every pause longer than this becomes a segment
         // boundary and therefore a separate transcription request.
-        //
-        // This was 400ms, which fragmented a 26-minute meeting into 322 requests with
-        // a median length of 3.5s. Whisper is a fixed 30-second-window model: below
-        // that it zero-pads the window and leans on its language-model prior, which
-        // was trained on web subtitles, so short clips come back as memorised
-        // boilerplate ("subscribe to the channel", "thank you") instead of speech.
-        // Measured on a real recording, 47% of segment boundaries sat in the
-        // 0.42-0.75s range that a longer redemption bridges.
-        //
-        // 500ms is the live-path policy (see the constant's doc comment). The
-        // batch value (2000ms, `import.rs`/`retranscription.rs`) was tried here
-        // first, but under continuous system audio it kept a VAD segment open
-        // indefinitely and withheld live transcript emission, so live and batch
-        // deliberately diverge. Bounded live segments under continuous speech
-        // are tracked in #756.
+        let effective_redemption_ms = if vad_redemption_time_ms > 0 {
+            vad_redemption_time_ms
+        } else {
+            VAD_REDEMPTION_TIME_MS
+        };
+
         let vad_processor =
-            ContinuousVadProcessor::new(sample_rate, VAD_REDEMPTION_TIME_MS)?;
+            ContinuousVadProcessor::new(sample_rate, effective_redemption_ms)?;
         info!(
             "VAD-driven pipeline: segments dispatched per speech burst (redemption_time={}ms)",
-            VAD_REDEMPTION_TIME_MS
+            effective_redemption_ms
         );
 
         // Initialize professional audio mixing components
         let ring_buffer = AudioMixerRingBuffer::new(sample_rate);
         let mixer = ProfessionalAudioMixer::new(sample_rate);
-
-        // Note: target_chunk_duration_ms is ignored - VAD controls segmentation now
-        let _ = target_chunk_duration_ms;
 
         Ok(Self {
             receiver,
@@ -984,7 +974,7 @@ impl AudioPipelineManager {
         &mut self,
         state: Arc<RecordingState>,
         transcription_sender: mpsc::UnboundedSender<AudioChunk>,
-        target_chunk_duration_ms: u32,
+        vad_redemption_time_ms: u32,
         sample_rate: u32,
         recording_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
         mic_device_name: String,
@@ -1006,7 +996,7 @@ impl AudioPipelineManager {
             audio_receiver,
             transcription_sender,
             state.clone(),
-            target_chunk_duration_ms,
+            vad_redemption_time_ms,
             sample_rate,
             mic_device_name,
             mic_device_kind,
@@ -1108,9 +1098,12 @@ mod tests {
 
     #[test]
     fn test_live_vad_redemption_matches_pro_policy() {
-        // Live uses the established 500ms pause policy; it does not bound
-        // uninterrupted speech. Batch import/retranscription use 2000ms.
+        // Live uses the established 500ms pause policy for system audio;
+        // mic-only uses 1500ms to allow natural speaking pauses.
+        // Batch import/retranscription use 2000ms.
         // See #679 and #756.
         assert_eq!(VAD_REDEMPTION_TIME_MS, 500);
+        assert_eq!(VAD_REDEMPTION_TIME_SYSTEM_MS, 500);
+        assert_eq!(VAD_REDEMPTION_TIME_MIC_ONLY_MS, 1500);
     }
 }

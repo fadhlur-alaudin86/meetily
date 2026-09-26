@@ -69,6 +69,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
     timestamp,
     text,
     confidence,
+    speaker,
     isStreaming,
     showConfidence,
 }: {
@@ -76,10 +77,12 @@ const TranscriptSegment = memo(function TranscriptSegment({
     timestamp: number;
     text: string;
     confidence?: number;
+    speaker?: string;
     isStreaming: boolean;
     showConfidence: boolean;
 }) {
-    const displayText = cleanStopWords(text) || (text.trim() === '' ? '[Silence]' : text);
+    const cleaned = cleanStopWords(text) || (text.trim() === '' ? '[Silence]' : text);
+    const displayText = speaker ? `${speaker}: ${cleaned}` : cleaned;
 
     return (
         <div id={`segment-${id}`} className="mb-3">
@@ -294,6 +297,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         timestamp={segment.timestamp}
                                         text={getDisplayText(segment)}
                                         confidence={segment.confidence}
+                                        speaker={segment.speaker}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
                                     />
@@ -350,6 +354,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         timestamp={segment.timestamp}
                                         text={getDisplayText(segment)}
                                         confidence={segment.confidence}
+                                        speaker={segment.speaker}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
                                     />

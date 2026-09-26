@@ -6,7 +6,7 @@ authors = ["Sujith S"]
 license = "MIT"
 repository = "https://github.com/Zackriya-Solutions/meeting-minutes"
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.94.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -155,6 +155,7 @@ tauri-plugin-store = "2.4.0"
 tauri-plugin-notification = "2.3.1"
 tauri-plugin-updater = "2.3.0"
 tauri-plugin-process = "2.3.0"
+polyvoice = { version = "=0.20.0", default-features = false, features = ["pipeline-tract"] }
 
 # Desktop-only single instance guard
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]

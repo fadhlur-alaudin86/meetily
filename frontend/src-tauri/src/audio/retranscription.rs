@@ -2,7 +2,7 @@
 
 use crate::audio::decoder::decode_audio_file;
 use crate::audio::vad::get_speech_chunks_with_progress;
-use super::common::{create_transcript_segments, split_segment_at_silence, write_transcripts_json};
+use super::common::{create_transcript_segments_with_speaker, split_segment_at_silence, write_transcripts_json};
 use super::constants::AUDIO_EXTENSIONS;
 use crate::config::{DEFAULT_WHISPER_MODEL, DEFAULT_PARAKEET_MODEL};
 use crate::parakeet_engine::ParakeetEngine;
@@ -226,6 +226,24 @@ async fn run_retranscription<R: Runtime>(
     .map_err(|e| anyhow!("Resample task panicked: {}", e))?;
     info!("Converted to 16kHz mono format: {} samples", audio_samples.len());
 
+    // Run speaker diarization on 16kHz audio samples
+    emit_progress(&app, &meeting_id, "diarization", 18, "Running speaker diarization...");
+    let samples_for_diarization = audio_samples.clone();
+    let diarization_segments = tokio::task::spawn_blocking(move || {
+        match crate::audio::diarization::BatchDiarizer::diarize(&samples_for_diarization, 16000) {
+            Ok(segs) => {
+                info!("Retranscription speaker diarization succeeded: {} segments", segs.len());
+                Some(segs)
+            }
+            Err(e) => {
+                warn!("Retranscription speaker diarization skipped: {}", e);
+                None
+            }
+        }
+    })
+    .await
+    .unwrap_or(None);
+
     emit_progress(&app, &meeting_id, "vad", 20, "Detecting speech segments...");
 
     // Check for cancellation
@@ -419,8 +437,11 @@ async fn run_retranscription<R: Runtime>(
 
     emit_progress(&app, &meeting_id, "saving", 80, "Saving transcripts...");
 
-    // Create transcript segments with proper timestamps from VAD
-    let segments = create_transcript_segments(&all_transcripts);
+    // Create transcript segments with proper timestamps and speaker from diarization
+    let segments = create_transcript_segments_with_speaker(
+        &all_transcripts,
+        diarization_segments.as_deref(),
+    );
 
     // Save to database
     let app_state = app
@@ -442,8 +463,8 @@ async fn run_retranscription<R: Runtime>(
 
     for segment in &segments {
         sqlx::query(
-            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration)
-             VALUES (?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&segment.id)
         .bind(&meeting_id)
@@ -452,6 +473,7 @@ async fn run_retranscription<R: Runtime>(
         .bind(segment.audio_start_time)
         .bind(segment.audio_end_time)
         .bind(segment.duration)
+        .bind(&segment.speaker)
         .execute(&mut *tx)
         .await
         .map_err(|e| anyhow!("Failed to insert transcript: {}", e))?;
@@ -837,6 +859,7 @@ pub async fn is_retranscription_in_progress_command() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::common::create_transcript_segments;
 
     #[test]
     fn test_create_transcript_segments_empty() {

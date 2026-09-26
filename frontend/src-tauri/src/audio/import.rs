@@ -18,7 +18,7 @@ use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
 
 use super::audio_processing::create_meeting_folder;
-use super::common::{create_transcript_segments, split_segment_at_silence, write_transcripts_json};
+use super::common::{create_transcript_segments_with_speaker, split_segment_at_silence, write_transcripts_json};
 use super::constants::AUDIO_EXTENSIONS;
 use super::recording_preferences::get_default_recordings_folder;
 
@@ -48,6 +48,33 @@ impl ImportGuard {
 impl Drop for ImportGuard {
     fn drop(&mut self) {
         IMPORT_IN_PROGRESS.store(false, Ordering::SeqCst);
+    }
+}
+
+/// RAII guard to clean up meeting folder if import fails or is cancelled
+struct FolderCleanupGuard {
+    folder: PathBuf,
+    disarmed: bool,
+}
+
+impl FolderCleanupGuard {
+    fn new(folder: PathBuf) -> Self {
+        Self {
+            folder,
+            disarmed: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for FolderCleanupGuard {
+    fn drop(&mut self) {
+        if !self.disarmed && self.folder.exists() {
+            let _ = std::fs::remove_dir_all(&self.folder);
+        }
     }
 }
 
@@ -342,6 +369,7 @@ async fn run_import<R: Runtime>(
     // Create meeting folder
     let base_folder = get_default_recordings_folder();
     let meeting_folder = create_meeting_folder(&base_folder, &title, false)?;
+    let mut folder_guard = FolderCleanupGuard::new(meeting_folder.clone());
 
     // Copy audio file to meeting folder
     emit_progress(&app, "copying", 10, "Copying audio file...");
@@ -419,6 +447,24 @@ async fn run_import<R: Runtime>(
         "Converted to 16kHz mono format: {} samples",
         audio_samples.len()
     );
+
+    // Run speaker diarization on 16kHz audio samples
+    emit_progress(&app, "diarization", 22, "Running speaker diarization...");
+    let samples_for_diarization = audio_samples.clone();
+    let diarization_segments = tokio::task::spawn_blocking(move || {
+        match crate::audio::diarization::BatchDiarizer::diarize(&samples_for_diarization, 16000) {
+            Ok(segs) => {
+                info!("Import speaker diarization succeeded: {} segments", segs.len());
+                Some(segs)
+            }
+            Err(e) => {
+                warn!("Import speaker diarization skipped: {}", e);
+                None
+            }
+        }
+    })
+    .await
+    .unwrap_or(None);
 
     emit_progress(&app, "vad", 25, "Detecting speech segments...");
 
@@ -630,8 +676,11 @@ async fn run_import<R: Runtime>(
 
     emit_progress(&app, "saving", 85, "Creating meeting...");
 
-    // Create transcript segments
-    let segments = create_transcript_segments(&all_transcripts);
+    // Create transcript segments with speaker diarization
+    let segments = create_transcript_segments_with_speaker(
+        &all_transcripts,
+        diarization_segments.as_deref(),
+    );
 
     // Save to database
     let app_state = app
@@ -650,7 +699,11 @@ async fn run_import<R: Runtime>(
     emit_progress(&app, "saving", 90, "Writing transcript files...");
 
     if let Err(e) = write_transcripts_json(&meeting_folder, &segments) {
-        warn!("Failed to write transcripts.json: {}", e);
+        let _ = sqlx::query("DELETE FROM meetings WHERE id = ?")
+            .bind(&meeting_id)
+            .execute(app_state.db_manager.pool())
+            .await;
+        return Err(anyhow!("Failed to write transcripts.json: {}", e));
     }
 
     if let Err(e) = write_import_metadata(
@@ -661,8 +714,15 @@ async fn run_import<R: Runtime>(
         &dest_filename,
         "import",
     ) {
-        warn!("Failed to write metadata.json: {}", e);
+        let _ = sqlx::query("DELETE FROM meetings WHERE id = ?")
+            .bind(&meeting_id)
+            .execute(app_state.db_manager.pool())
+            .await;
+        return Err(anyhow!("Failed to write metadata.json: {}", e));
     }
+
+    // Successfully completed import - disarm folder cleanup guard
+    folder_guard.disarm();
 
     emit_progress(&app, "complete", 100, "Import complete");
 
@@ -720,8 +780,8 @@ async fn create_meeting_with_transcripts(
     // Insert transcripts
     for segment in segments {
         sqlx::query(
-            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&segment.id)
         .bind(&meeting_id)
@@ -730,6 +790,7 @@ async fn create_meeting_with_transcripts(
         .bind(segment.audio_start_time)
         .bind(segment.audio_end_time)
         .bind(segment.duration)
+        .bind(&segment.speaker)
         .execute(&mut *tx)
         .await
         .map_err(|e| anyhow!("Failed to insert transcript: {}", e))?;
@@ -1008,6 +1069,7 @@ pub async fn is_import_in_progress_command() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::common::create_transcript_segments;
 
     #[test]
     fn test_audio_extensions() {
@@ -1182,6 +1244,7 @@ mod tests {
                 audio_start_time: Some(0.0),
                 audio_end_time: Some(1.5),
                 duration: Some(1.5),
+                speaker: None,
             },
             TranscriptSegment {
                 id: "t-2".to_string(),
@@ -1190,6 +1253,7 @@ mod tests {
                 audio_start_time: Some(2.0),
                 audio_end_time: Some(3.5),
                 duration: Some(1.5),
+                speaker: None,
             },
         ];
 

@@ -48,13 +48,26 @@ pub(crate) async fn unload_engine_after_batch(use_parakeet: bool) {
 
 /// Create transcript segments from transcription results.
 /// Each tuple is (text, start_ms, end_ms) from VAD timestamps.
+#[allow(dead_code)]
 pub(crate) fn create_transcript_segments(transcripts: &[(String, f64, f64)]) -> Vec<TranscriptSegment> {
+    create_transcript_segments_with_speaker(transcripts, None)
+}
+
+/// Create transcript segments with speaker diarization matching.
+pub(crate) fn create_transcript_segments_with_speaker(
+    transcripts: &[(String, f64, f64)],
+    diarization_segments: Option<&[crate::audio::diarization::DiarizationSegment]>,
+) -> Vec<TranscriptSegment> {
     transcripts
         .iter()
         .map(|(text, start_ms, end_ms)| {
             let start_seconds = start_ms / 1000.0;
             let end_seconds = end_ms / 1000.0;
             let duration = end_seconds - start_seconds;
+
+            let speaker = diarization_segments.and_then(|segs| {
+                crate::audio::diarization::get_speaker_for_time_range(segs, start_seconds, end_seconds)
+            });
 
             TranscriptSegment {
                 id: format!("transcript-{}", Uuid::new_v4()),
@@ -63,6 +76,7 @@ pub(crate) fn create_transcript_segments(transcripts: &[(String, f64, f64)]) -> 
                 audio_start_time: Some(start_seconds),
                 audio_end_time: Some(end_seconds),
                 duration: Some(duration),
+                speaker,
             }
         })
         .collect()
@@ -85,7 +99,8 @@ pub(crate) fn write_transcripts_json(folder: &Path, segments: &[TranscriptSegmen
                 "audio_start_time": s.audio_start_time,
                 "audio_end_time": s.audio_end_time,
                 "duration": s.duration,
-                "sequence_id": i
+                "sequence_id": i,
+                "speaker": s.speaker,
             })
         }).collect::<Vec<_>>()
     });

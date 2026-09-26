@@ -42,6 +42,8 @@ pub struct TranscriptUpdate {
     pub audio_start_time: f64, // Seconds from recording start (e.g., 125.3)
     pub audio_end_time: f64,   // Seconds from recording start (e.g., 128.6)
     pub duration: f64,          // Segment duration in seconds (e.g., 3.3)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
 }
 
 // NOTE: get_transcript_history and get_recording_meeting_name functions
@@ -149,6 +151,13 @@ pub fn start_transcription_task<R: Runtime>(
 
                             let chunk_timestamp = chunk.timestamp;
                             let chunk_duration = chunk.data.len() as f64 / chunk.sample_rate as f64;
+                            let chunk_device_type = chunk.device_type.clone();
+                            let chunk_id = chunk.chunk_id;
+                            let chunk_data_for_diarize = if matches!(chunk_device_type, crate::audio::recording_state::DeviceType::System) {
+                                chunk.data.clone()
+                            } else {
+                                Vec::new()
+                            };
 
                             // Transcribe with provider-agnostic approach
                             match transcribe_chunk_with_provider(
@@ -203,6 +212,13 @@ pub fn start_transcription_task<R: Runtime>(
 
                                         // Emit transcript update with NEW recording-relative timestamps
 
+                                        let speaker = if matches!(chunk_device_type, crate::audio::recording_state::DeviceType::System) {
+                                            let diarizer = crate::audio::diarization::get_live_system_diarizer();
+                                            Some(diarizer.identify_speaker(&chunk_data_for_diarize, chunk_id))
+                                        } else {
+                                            None
+                                        };
+
                                         let update = TranscriptUpdate {
                                             text: transcript,
                                             timestamp: format_current_timestamp(), // Wall-clock for reference
@@ -215,6 +231,7 @@ pub fn start_transcription_task<R: Runtime>(
                                             audio_start_time,
                                             audio_end_time,
                                             duration: chunk_duration,
+                                            speaker,
                                         };
 
                                         if let Err(e) = app_clone.emit("transcript-update", &update)
