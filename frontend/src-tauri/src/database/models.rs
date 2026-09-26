@@ -129,3 +129,13 @@ pub struct TranscriptSetting {
     #[serde(rename = "openaiApiKey")]
     pub openai_api_key: Option<String>,
 }
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct MeetingBackup {
+    pub meeting_id: String,
+    pub backup_path: String,
+    pub status: String, // "ok", "partial", "failed"
+    pub backed_up_at: String,
+    pub has_audio: bool,
+    pub has_summary: bool,
+}

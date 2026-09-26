@@ -156,6 +156,7 @@ tauri-plugin-notification = "2.3.1"
 tauri-plugin-updater = "2.3.0"
 tauri-plugin-process = "2.3.0"
 polyvoice = { version = "=0.20.0", default-features = false, features = ["pipeline-tract"] }
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
 # Desktop-only single instance guard
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]

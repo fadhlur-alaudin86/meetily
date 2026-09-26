@@ -145,3 +145,19 @@ export interface TranscriptSegmentData {
   confidence?: number;
   speaker?: string;
 }
+
+export type BackupStatus = 'ok' | 'partial' | 'failed' | 'none';
+
+export interface MeetingBackup {
+  meeting_id: string;
+  backup_path: string;
+  status: 'ok' | 'partial' | 'failed';
+  backed_up_at: string;
+  has_audio: boolean;
+  has_summary: boolean;
+}
+
+export interface BackupPreferences {
+  backup_folder: string;
+  auto_backup: boolean;
+}

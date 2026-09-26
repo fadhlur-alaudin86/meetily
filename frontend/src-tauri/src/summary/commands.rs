@@ -112,6 +112,29 @@ pub async fn api_save_meeting_summary<R: Runtime>(
     match SummaryProcessesRepository::update_meeting_summary(pool, &meeting_id, &summary).await {
         Ok(true) => {
             log_info!("Summary saved successfully for meeting_id: {}", meeting_id);
+            // Also update summary.json in meeting folder if folder exists
+            if let Ok(Some(meeting)) = crate::database::repositories::meeting::MeetingsRepository::get_meeting_metadata(pool, &meeting_id).await {
+                if let Some(folder_path_str) = meeting.folder_path.filter(|p| !p.trim().is_empty()) {
+                    let folder = std::path::PathBuf::from(folder_path_str);
+                    if folder.exists() {
+                        let summary_file = folder.join("summary.json");
+                        let payload = serde_json::json!({
+                            "meeting_id": &meeting_id,
+                            "title": meeting.title,
+                            "created_at": meeting.created_at,
+                            "summary": &summary,
+                        });
+                        if let Ok(json_str) = serde_json::to_string_pretty(&payload) {
+                            let _ = std::fs::write(&summary_file, json_str);
+                        }
+                    }
+                }
+            }
+            crate::backup::BackupService::trigger_auto_backup(
+                _app.clone(),
+                pool.clone(),
+                meeting_id.clone(),
+            );
             Ok(serde_json::json!({
                 "message": "Meeting summary saved successfully"
             }))
