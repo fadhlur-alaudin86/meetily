@@ -59,7 +59,6 @@ impl BackupService {
         let sanitized_title = sanitize_filename(&meeting.title);
         let zip_filename = format!("{}_{}_backup.zip", date_prefix, sanitized_title);
         let target_zip_path = backup_dir.join(&zip_filename);
-        let temp_zip_path = backup_dir.join(format!(".{}.tmp", zip_filename));
 
         info!(
             "Creating backup package for meeting '{}' at {:?}",
@@ -114,6 +113,120 @@ impl BackupService {
         Ok(results)
     }
 
+    /// Packs all files in `meeting_folder` into a zip archive at `target_zip_path`.
+    ///
+    /// - Skips `.checkpoints/` sub-directory and any hidden or `.tmp` files.
+    /// - Returns `(has_audio, has_summary)` derived from the files packed.
+    /// - Writes atomically: fills a `.tmp` file first, then renames on success.
+    fn pack_meeting_zip(meeting_folder: &std::path::Path, target_zip_path: &std::path::Path) -> Result<(bool, bool)> {
+        let parent = target_zip_path
+            .parent()
+            .ok_or_else(|| anyhow!("Target zip path has no parent directory"))?;
+        let tmp_path = parent.join(format!(
+            ".{}.tmp",
+            target_zip_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        ));
+
+        let tmp_file = File::create(&tmp_path)
+            .map_err(|e| anyhow!("Failed to create temp zip file {:?}: {}", tmp_path, e))?;
+
+        let mut zip = ZipWriter::new(tmp_file);
+        let options = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o644);
+
+        let mut has_audio = false;
+        let mut has_summary = false;
+
+        Self::walk_and_pack(meeting_folder, meeting_folder, &mut zip, &options, &mut has_audio, &mut has_summary)
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&tmp_path);
+                e
+            })?;
+
+        zip.finish()
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&tmp_path);
+                anyhow!("Failed to finalize zip archive: {}", e)
+            })?;
+
+        // Atomic rename
+        std::fs::rename(&tmp_path, target_zip_path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            anyhow!("Failed to rename temp zip to final path {:?}: {}", target_zip_path, e)
+        })?;
+
+        info!(
+            "Packed meeting folder {:?} -> {:?} (has_audio={}, has_summary={})",
+            meeting_folder, target_zip_path, has_audio, has_summary
+        );
+
+        Ok((has_audio, has_summary))
+    }
+
+    /// Recursively walks `current_dir` relative to `base`, adding files to the zip writer.
+    fn walk_and_pack(
+        base: &std::path::Path,
+        current_dir: &std::path::Path,
+        zip: &mut ZipWriter<File>,
+        options: &SimpleFileOptions,
+        has_audio: &mut bool,
+        has_summary: &mut bool,
+    ) -> Result<()> {
+        for entry in std::fs::read_dir(current_dir)
+            .map_err(|e| anyhow!("Failed to read directory {:?}: {}", current_dir, e))?
+        {
+            let entry = entry.map_err(|e| anyhow!("Failed to read dir entry: {}", e))?;
+            let path = entry.path();
+
+            // Compute relative path for the zip entry name
+            let rel = path.strip_prefix(base)
+                .map_err(|_| anyhow!("Path {:?} is not under base {:?}", path, base))?;
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+
+            if path.is_dir() {
+                // Skip .checkpoints - only needed for in-progress encoding, not for portability
+                let dir_name = path.file_name().unwrap_or_default().to_string_lossy();
+                if dir_name == ".checkpoints" {
+                    continue;
+                }
+                // Recurse into other sub-directories
+                Self::walk_and_pack(base, &path, zip, options, has_audio, has_summary)?;
+            } else {
+                let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+
+                // Skip temp files and hidden files
+                if file_name.ends_with(".tmp") || file_name.starts_with('.') {
+                    continue;
+                }
+
+                // Detect audio and summary presence
+                let lower = file_name.to_lowercase();
+                if lower.ends_with(".ogg") || lower.ends_with(".mp4") || lower.ends_with(".wav") {
+                    *has_audio = true;
+                }
+                if lower == "summary.json" {
+                    *has_summary = true;
+                }
+
+                // Read and add to zip
+                let mut f = File::open(&path)
+                    .map_err(|e| anyhow!("Failed to open {:?}: {}", path, e))?;
+                zip.start_file(rel_str, *options)
+                    .map_err(|e| anyhow!("Failed to start zip entry: {}", e))?;
+                let mut buf = Vec::new();
+                f.read_to_end(&mut buf)
+                    .map_err(|e| anyhow!("Failed to read {:?}: {}", path, e))?;
+                zip.write_all(&buf)
+                    .map_err(|e| anyhow!("Failed to write zip entry: {}", e))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Background trigger for auto-backup
     pub fn trigger_auto_backup<R: Runtime>(
         app: AppHandle<R>,
@@ -138,5 +251,110 @@ impl BackupService {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use tempfile::TempDir;
+    use zip::ZipArchive;
+
+    fn create_file(path: &std::path::Path, content: &[u8]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn test_pack_basic_files() {
+        let meeting_dir = TempDir::new().unwrap();
+        let out_dir = TempDir::new().unwrap();
+
+        create_file(&meeting_dir.path().join("metadata.json"), b"{\"version\":\"1.0\"}");
+        create_file(&meeting_dir.path().join("transcripts.json"), b"[]");
+
+        let zip_path = out_dir.path().join("test_backup.zip");
+        let (has_audio, has_summary) =
+            BackupService::pack_meeting_zip(meeting_dir.path(), &zip_path).unwrap();
+
+        assert!(zip_path.exists(), "zip file should be created");
+        assert!(!has_audio);
+        assert!(!has_summary);
+
+        let mut archive = ZipArchive::new(File::open(&zip_path).unwrap()).unwrap();
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(names.contains(&"metadata.json".to_string()));
+        assert!(names.contains(&"transcripts.json".to_string()));
+    }
+
+    #[test]
+    fn test_pack_detects_audio_and_summary() {
+        let meeting_dir = TempDir::new().unwrap();
+        let out_dir = TempDir::new().unwrap();
+
+        create_file(&meeting_dir.path().join("mic.ogg"), b"fake_ogg");
+        create_file(&meeting_dir.path().join("system.ogg"), b"fake_ogg");
+        create_file(&meeting_dir.path().join("summary.json"), b"{\"markdown\":\"# Summary\"}");
+        create_file(&meeting_dir.path().join("transcripts.json"), b"[]");
+
+        let zip_path = out_dir.path().join("test_backup.zip");
+        let (has_audio, has_summary) =
+            BackupService::pack_meeting_zip(meeting_dir.path(), &zip_path).unwrap();
+
+        assert!(has_audio, "should detect .ogg audio files");
+        assert!(has_summary, "should detect summary.json");
+    }
+
+    #[test]
+    fn test_pack_excludes_checkpoints_and_hidden() {
+        let meeting_dir = TempDir::new().unwrap();
+        let out_dir = TempDir::new().unwrap();
+
+        create_file(&meeting_dir.path().join("metadata.json"), b"{}");
+        create_file(
+            &meeting_dir.path().join(".checkpoints").join("chunk_0001.ogg"),
+            b"raw_chunk",
+        );
+        create_file(&meeting_dir.path().join(".hidden_file"), b"hidden");
+        create_file(&meeting_dir.path().join("temp.tmp"), b"temp");
+
+        let zip_path = out_dir.path().join("test_backup.zip");
+        BackupService::pack_meeting_zip(meeting_dir.path(), &zip_path).unwrap();
+
+        let mut archive = ZipArchive::new(File::open(&zip_path).unwrap()).unwrap();
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect();
+
+        assert!(
+            !names.iter().any(|n| n.contains(".checkpoints")),
+            ".checkpoints must be excluded"
+        );
+        assert!(!names.contains(&".hidden_file".to_string()));
+        assert!(!names.contains(&"temp.tmp".to_string()));
+        assert!(names.contains(&"metadata.json".to_string()));
+    }
+
+    #[test]
+    fn test_pack_file_content_integrity() {
+        let meeting_dir = TempDir::new().unwrap();
+        let out_dir = TempDir::new().unwrap();
+
+        let expected = b"hello from meetily backup test";
+        create_file(&meeting_dir.path().join("transcripts.json"), expected);
+
+        let zip_path = out_dir.path().join("test_backup.zip");
+        BackupService::pack_meeting_zip(meeting_dir.path(), &zip_path).unwrap();
+
+        let mut archive = ZipArchive::new(File::open(&zip_path).unwrap()).unwrap();
+        let mut entry = archive.by_name("transcripts.json").unwrap();
+        let mut content = Vec::new();
+        entry.read_to_end(&mut content).unwrap();
+        assert_eq!(content, expected, "file content must be preserved exactly");
     }
 }

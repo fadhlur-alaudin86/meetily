@@ -841,6 +841,9 @@ pub fn run() {
             backup::commands::api_get_all_backup_statuses,
             backup::commands::api_get_backup_preferences,
             backup::commands::api_save_backup_preferences,
+            backup::commands::api_select_backup_folder,
+            backup::commands::api_open_backup_folder,
+            backup::commands::api_reset_backup_folder_to_default,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -74,3 +74,73 @@ pub async fn api_save_backup_preferences<R: Runtime>(
         .await
         .map_err(|e| e.to_string())
 }
+
+#[tauri::command]
+pub async fn api_select_backup_folder<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let folder_path = app.dialog().file().blocking_pick_folder();
+
+    if let Some(path) = folder_path {
+        let path_str = path.to_string();
+        if let Ok(mut prefs) = load_backup_preferences(&app).await {
+            prefs.backup_folder = PathBuf::from(&path_str);
+            let _ = save_backup_preferences(&app, &prefs).await;
+        }
+        Ok(Some(path_str))
+    } else {
+        Ok(None)
+    }
+}
+
+#[tauri::command]
+pub async fn api_open_backup_folder<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    let prefs = load_backup_preferences(&app).await.map_err(|e| e.to_string())?;
+    super::preferences::ensure_backup_directory(&prefs.backup_folder).map_err(|e| e.to_string())?;
+
+    let folder_path = prefs.backup_folder.to_string_lossy().to_string();
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(&folder_path)
+            .spawn()
+            .map_err(|e| format!("Failed to open folder: {}", e))?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&folder_path)
+            .spawn()
+            .map_err(|e| format!("Failed to open folder: {}", e))?;
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&folder_path)
+            .spawn()
+            .map_err(|e| format!("Failed to open folder: {}", e))?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn api_reset_backup_folder_to_default<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<String, String> {
+    let default_folder = super::preferences::get_default_backup_folder();
+    let default_str = default_folder.to_string_lossy().to_string();
+
+    if let Ok(mut prefs) = load_backup_preferences(&app).await {
+        prefs.backup_folder = default_folder;
+        let _ = save_backup_preferences(&app, &prefs).await;
+    }
+
+    Ok(default_str)
+}
+
