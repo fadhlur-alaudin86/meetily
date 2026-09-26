@@ -169,6 +169,264 @@ fn find_audio_file(folder: &Path) -> Result<PathBuf> {
     Err(anyhow!("No audio file found in: {}", folder.display()))
 }
 
+/// Detected audio tracks in meeting folder
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetectedAudioTracks {
+    Dual { mic: PathBuf, system: PathBuf },
+    Single(PathBuf),
+}
+
+/// Detects whether folder has dual-track (mic + system) audio or single-track audio
+pub fn detect_audio_tracks(folder: &Path) -> Result<DetectedAudioTracks> {
+    let mic_candidates = [
+        "mic.ogg", "mic.mp4", "mic.wav", "mic.m4a", "mic.flac", "mic.webm",
+    ];
+    let sys_candidates = [
+        "system.ogg", "system.mp4", "system.wav", "system.m4a", "system.flac", "system.webm",
+    ];
+
+    let mut found_mic = None;
+    for name in mic_candidates {
+        let p = folder.join(name);
+        if p.exists() {
+            found_mic = Some(p);
+            break;
+        }
+    }
+
+    let mut found_sys = None;
+    for name in sys_candidates {
+        let p = folder.join(name);
+        if p.exists() {
+            found_sys = Some(p);
+            break;
+        }
+    }
+
+    if let (Some(mic), Some(system)) = (found_mic, found_sys) {
+        return Ok(DetectedAudioTracks::Dual { mic, system });
+    }
+
+    let single = find_audio_file(folder)?;
+    Ok(DetectedAudioTracks::Single(single))
+}
+
+/// Helper function to process and transcribe a single audio track (mic or system)
+async fn process_single_audio_track<R: Runtime>(
+    app: &AppHandle<R>,
+    meeting_id: &str,
+    audio_path: &Path,
+    whisper_engine: Option<&Arc<WhisperEngine>>,
+    parakeet_engine: Option<&Arc<ParakeetEngine>>,
+    language: Option<&str>,
+    track_label: &str,
+    run_diarization: bool,
+    fixed_speaker: Option<String>,
+    progress_start: u32,
+    progress_end: u32,
+) -> Result<(Vec<crate::api::TranscriptSegment>, f64)> {
+    let progress_span = (progress_end - progress_start) as f32;
+
+    emit_progress(
+        app,
+        meeting_id,
+        "decoding",
+        progress_start + (progress_span * 0.05) as u32,
+        &format!("Decoding {} ({:?})...", track_label, audio_path.file_name().unwrap_or_default()),
+    );
+
+    if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
+        return Err(anyhow!("Retranscription cancelled"));
+    }
+
+    let path_for_decode = audio_path.to_path_buf();
+    let decoded = tokio::task::spawn_blocking(move || {
+        decode_audio_file(&path_for_decode)
+    })
+    .await
+    .map_err(|e| anyhow!("Decode task panicked: {}", e))??;
+    let duration_seconds = decoded.duration_seconds;
+
+    info!(
+        "Decoded {}: {:.2}s, {}Hz, {} channels",
+        track_label, duration_seconds, decoded.sample_rate, decoded.channels
+    );
+
+    emit_progress(
+        app,
+        meeting_id,
+        "decoding",
+        progress_start + (progress_span * 0.15) as u32,
+        &format!("Converting {} format...", track_label),
+    );
+
+    if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
+        return Err(anyhow!("Retranscription cancelled"));
+    }
+
+    let audio_samples = tokio::task::spawn_blocking(move || {
+        decoded.to_whisper_format()
+    })
+    .await
+    .map_err(|e| anyhow!("Resample task panicked: {}", e))?;
+
+    // Run speaker diarization if requested
+    let diarization_segments = if run_diarization {
+        emit_progress(
+            app,
+            meeting_id,
+            "diarization",
+            progress_start + (progress_span * 0.20) as u32,
+            &format!("Running speaker diarization on {}...", track_label),
+        );
+        let samples_for_diarization = audio_samples.clone();
+        let track_label_log = track_label.to_string();
+        tokio::task::spawn_blocking(move || {
+            match crate::audio::diarization::BatchDiarizer::diarize(&samples_for_diarization, 16000) {
+                Ok(segs) => {
+                    info!("Speaker diarization succeeded for {}: {} segments", track_label_log, segs.len());
+                    Some(segs)
+                }
+                Err(e) => {
+                    warn!("Speaker diarization skipped for {}: {}", track_label_log, e);
+                    None
+                }
+            }
+        })
+        .await
+        .unwrap_or(None)
+    } else {
+        None
+    };
+
+    emit_progress(
+        app,
+        meeting_id,
+        "vad",
+        progress_start + (progress_span * 0.25) as u32,
+        &format!("Detecting speech in {}...", track_label),
+    );
+
+    if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
+        return Err(anyhow!("Retranscription cancelled"));
+    }
+
+    let app_for_vad = app.clone();
+    let meeting_id_for_vad = meeting_id.to_string();
+    let track_label_vad = track_label.to_string();
+
+    let speech_segments = tokio::task::spawn_blocking(move || {
+        get_speech_chunks_with_progress(
+            &audio_samples,
+            VAD_REDEMPTION_TIME_MS,
+            |vad_progress, segments_found| {
+                let p = progress_start + (progress_span * 0.25) as u32 + (vad_progress as f32 * 0.05 * (progress_span / 100.0)) as u32;
+                emit_progress(
+                    &app_for_vad,
+                    &meeting_id_for_vad,
+                    "vad",
+                    p,
+                    &format!("Detecting speech in {}... {}% ({} found)", track_label_vad, vad_progress, segments_found),
+                );
+                !RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst)
+            },
+        )
+    })
+    .await
+    .map_err(|e| anyhow!("VAD task panicked: {}", e))?
+    .map_err(|e| anyhow!("VAD processing failed: {}", e))?;
+
+    let total_segments = speech_segments.len();
+    info!("VAD detected {} speech segments for {}", total_segments, track_label);
+
+    if total_segments == 0 {
+        info!("No speech detected in {}", track_label);
+        return Ok((Vec::new(), duration_seconds));
+    }
+
+    const MAX_SEGMENT_SAMPLES: usize = 25 * 16000;
+    let mut processable_segments: Vec<crate::audio::vad::SpeechSegment> = Vec::new();
+    for segment in &speech_segments {
+        if segment.samples.len() > MAX_SEGMENT_SAMPLES {
+            let sub_segments = split_segment_at_silence(segment, MAX_SEGMENT_SAMPLES);
+            processable_segments.extend(sub_segments);
+        } else {
+            processable_segments.push(segment.clone());
+        }
+    }
+
+    let processable_count = processable_segments.len();
+    let mut all_transcripts: Vec<(String, f64, f64)> = Vec::new();
+
+    let use_parakeet = parakeet_engine.is_some();
+
+    for (i, segment) in processable_segments.iter().enumerate() {
+        if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
+            return Err(anyhow!("Retranscription cancelled"));
+        }
+
+        let p_start = progress_start + (progress_span * 0.35) as u32;
+        let p_end = progress_end;
+        let p_range = (p_end - p_start) as f32;
+        let progress = p_start + ((i as f32 / processable_count as f32) * p_range) as u32;
+
+        let segment_duration_sec = (segment.end_timestamp_ms - segment.start_timestamp_ms) / 1000.0;
+        emit_progress(
+            app,
+            meeting_id,
+            "transcribing",
+            progress,
+            &format!(
+                "Transcribing {} segment {}/{} ({:.1}s)...",
+                track_label,
+                i + 1,
+                processable_count,
+                segment_duration_sec
+            ),
+        );
+
+        if segment.samples.len() < 1600 {
+            continue;
+        }
+
+        let (text, _conf) = if use_parakeet {
+            let engine = parakeet_engine.unwrap();
+            let text = engine
+                .transcribe_audio(segment.samples.clone())
+                .await
+                .map_err(|e| anyhow!("Parakeet transcription failed on segment {}: {}", i, e))?;
+            (text, 0.9f32)
+        } else {
+            let engine = whisper_engine.unwrap();
+            let (text, conf, _) = engine
+                .transcribe_audio_with_confidence(segment.samples.clone(), language.map(|s| s.to_string()))
+                .await
+                .map_err(|e| anyhow!("Whisper transcription failed on segment {}: {}", i, e))?;
+            (text, conf)
+        };
+
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            all_transcripts.push((text, segment.start_timestamp_ms, segment.end_timestamp_ms));
+        }
+    }
+
+    // Convert into TranscriptSegments
+    let segments: Vec<crate::api::TranscriptSegment> = if let Some(ref speaker_name) = fixed_speaker {
+        create_transcript_segments_with_speaker(&all_transcripts, None)
+            .into_iter()
+            .map(|mut s| {
+                s.speaker = Some(speaker_name.clone());
+                s
+            })
+            .collect()
+    } else {
+        create_transcript_segments_with_speaker(&all_transcripts, diarization_segments.as_deref())
+    };
+
+    Ok((segments, duration_seconds))
+}
+
 /// Internal function to run retranscription
 async fn run_retranscription<R: Runtime>(
     app: AppHandle<R>,
@@ -179,145 +437,17 @@ async fn run_retranscription<R: Runtime>(
     provider: Option<String>,
 ) -> Result<RetranscriptionResult> {
     let folder_path = PathBuf::from(&meeting_folder_path);
-    let audio_path = find_audio_file(&folder_path)?;
+    let detected_tracks = detect_audio_tracks(&folder_path)?;
 
-    // Determine which provider to use (default to whisper)
     let use_parakeet = provider.as_deref() == Some("parakeet");
 
     info!(
-        "Starting retranscription for meeting {} with language {:?}, model {:?}, provider {:?}",
-        meeting_id, language, model, provider
+        "Starting retranscription for meeting {} (tracks: {:?}) with language {:?}, model {:?}, provider {:?}",
+        meeting_id, detected_tracks, language, model, provider
     );
 
-    // Emit progress: decoding
-    emit_progress(&app, &meeting_id, "decoding", 5, "Decoding audio file...");
-
-    // Check for cancellation
-    if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
-        return Err(anyhow!("Retranscription cancelled"));
-    }
-
-    // Decode the audio file (CPU-intensive, run in blocking task)
-    let path_for_decode = audio_path.clone();
-    let decoded = tokio::task::spawn_blocking(move || {
-        decode_audio_file(&path_for_decode)
-    })
-    .await
-    .map_err(|e| anyhow!("Decode task panicked: {}", e))??;
-    let duration_seconds = decoded.duration_seconds;
-
-    info!(
-        "Decoded audio: {:.2}s, {}Hz, {} channels",
-        duration_seconds, decoded.sample_rate, decoded.channels
-    );
-
-    emit_progress(&app, &meeting_id, "decoding", 15, "Converting audio format...");
-
-    // Check for cancellation
-    if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
-        return Err(anyhow!("Retranscription cancelled"));
-    }
-
-    // Convert to 16kHz mono format (CPU-intensive, run in blocking task)
-    let audio_samples = tokio::task::spawn_blocking(move || {
-        decoded.to_whisper_format()
-    })
-    .await
-    .map_err(|e| anyhow!("Resample task panicked: {}", e))?;
-    info!("Converted to 16kHz mono format: {} samples", audio_samples.len());
-
-    // Run speaker diarization on 16kHz audio samples
-    emit_progress(&app, &meeting_id, "diarization", 18, "Running speaker diarization...");
-    let samples_for_diarization = audio_samples.clone();
-    let diarization_segments = tokio::task::spawn_blocking(move || {
-        match crate::audio::diarization::BatchDiarizer::diarize(&samples_for_diarization, 16000) {
-            Ok(segs) => {
-                info!("Retranscription speaker diarization succeeded: {} segments", segs.len());
-                Some(segs)
-            }
-            Err(e) => {
-                warn!("Retranscription speaker diarization skipped: {}", e);
-                None
-            }
-        }
-    })
-    .await
-    .unwrap_or(None);
-
-    emit_progress(&app, &meeting_id, "vad", 20, "Detecting speech segments...");
-
-    // Check for cancellation
-    if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
-        return Err(anyhow!("Retranscription cancelled"));
-    }
-
-    // Use VAD to find natural speech boundaries (same approach as live transcription)
-    // IMPORTANT: Run VAD in a blocking task to avoid blocking the async runtime
-    // For large files (35+ minutes), VAD processing can take several minutes
-    let app_for_vad = app.clone();
-    let meeting_id_for_vad = meeting_id.clone();
-
-    let speech_segments = tokio::task::spawn_blocking(move || {
-        get_speech_chunks_with_progress(
-            &audio_samples,
-            VAD_REDEMPTION_TIME_MS,
-            |vad_progress, segments_found| {
-                // Map VAD progress (0-100) to overall progress (20-25)
-                let overall_progress = 20 + (vad_progress as f32 * 0.05) as u32;
-                emit_progress(
-                    &app_for_vad,
-                    &meeting_id_for_vad,
-                    "vad",
-                    overall_progress,
-                    &format!("Detecting speech segments... {}% ({} found)", vad_progress, segments_found),
-                );
-
-                // Return false to cancel if cancellation requested
-                !RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst)
-            },
-        )
-    })
-    .await
-    .map_err(|e| anyhow!("VAD task panicked: {}", e))?
-    .map_err(|e| anyhow!("VAD processing failed: {}", e))?;
-
-    let total_segments = speech_segments.len();
-    info!("VAD detected {} speech segments (redemption_time={}ms)", total_segments, VAD_REDEMPTION_TIME_MS);
-
-    // Diagnostic: log segment duration distribution
-    if !speech_segments.is_empty() {
-        let durations_ms: Vec<f64> = speech_segments.iter()
-            .map(|s| s.end_timestamp_ms - s.start_timestamp_ms)
-            .collect();
-        let total_speech_ms: f64 = durations_ms.iter().sum();
-        let avg_duration = total_speech_ms / durations_ms.len() as f64;
-        let min_duration = durations_ms.iter().cloned().fold(f64::INFINITY, f64::min);
-        let max_duration = durations_ms.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        info!(
-            "VAD segment stats: avg={:.0}ms, min={:.0}ms, max={:.0}ms, total_speech={:.1}s/{:.1}s ({:.0}%)",
-            avg_duration, min_duration, max_duration,
-            total_speech_ms / 1000.0, duration_seconds,
-            (total_speech_ms / 1000.0 / duration_seconds) * 100.0
-        );
-        // Log first 10 segments for detailed inspection
-        for (i, seg) in speech_segments.iter().take(10).enumerate() {
-            let dur = seg.end_timestamp_ms - seg.start_timestamp_ms;
-            debug!("  Segment {}: {:.0}ms-{:.0}ms ({:.0}ms, {} samples)",
-                i, seg.start_timestamp_ms, seg.end_timestamp_ms, dur, seg.samples.len());
-        }
-        if total_segments > 10 {
-            debug!("  ... and {} more segments", total_segments - 10);
-        }
-    }
-
-    if total_segments == 0 {
-        warn!("No speech detected in audio");
-        return Err(anyhow!("No speech detected in audio file"));
-    }
-
-    emit_progress(&app, &meeting_id, "transcribing", 25, "Loading transcription engine...");
-
-    // Initialize the appropriate engine once (not per-segment)
+    // Initialize the appropriate engine once
+    emit_progress(&app, &meeting_id, "transcribing", 5, "Loading transcription engine...");
     let whisper_engine = if !use_parakeet {
         Some(get_or_init_whisper(&app, model.as_deref()).await?)
     } else {
@@ -329,126 +459,99 @@ async fn run_retranscription<R: Runtime>(
         None
     };
 
-    // Split very long segments at silence boundaries for better transcription quality.
-    // Hard cuts at arbitrary sample positions lose words at boundaries. Instead, scan
-    // for the lowest-energy window near the target split point and cut there.
-    const MAX_SEGMENT_SAMPLES: usize = 25 * 16000; // 25 seconds at 16kHz
+    let (segments, duration_seconds, audio_filename) = match detected_tracks {
+        DetectedAudioTracks::Dual { mic, system } => {
+            info!("Running dual-track retranscription: mic={:?}, sys={:?}", mic, system);
 
-    let mut processable_segments: Vec<crate::audio::vad::SpeechSegment> = Vec::new();
-    for segment in &speech_segments {
-        if segment.samples.len() > MAX_SEGMENT_SAMPLES {
-            debug!(
-                "Splitting large segment ({:.0}ms, {} samples) at silence boundaries",
-                segment.end_timestamp_ms - segment.start_timestamp_ms,
-                segment.samples.len()
-            );
+            // Phase 1: Microphone (labeled as "ME")
+            let (mut mic_segments, mic_dur) = process_single_audio_track(
+                &app,
+                &meeting_id,
+                &mic,
+                whisper_engine.as_ref(),
+                parakeet_engine.as_ref(),
+                language.as_deref(),
+                "Microphone",
+                false,
+                Some("ME".to_string()),
+                5,
+                45,
+            )
+            .await?;
 
-            let sub_segments = split_segment_at_silence(segment, MAX_SEGMENT_SAMPLES);
-            debug!("Split into {} sub-segments", sub_segments.len());
-            processable_segments.extend(sub_segments);
-        } else {
-            processable_segments.push(segment.clone());
+            // Phase 2: System Audio (diarized as SPEAKER_00, SPEAKER_01, ...)
+            let (mut sys_segments, sys_dur) = process_single_audio_track(
+                &app,
+                &meeting_id,
+                &system,
+                whisper_engine.as_ref(),
+                parakeet_engine.as_ref(),
+                language.as_deref(),
+                "System Audio",
+                true,
+                None,
+                45,
+                85,
+            )
+            .await?;
+
+            // Phase 3: Combine and sort chronologically
+            let mut combined = Vec::with_capacity(mic_segments.len() + sys_segments.len());
+            combined.append(&mut mic_segments);
+            combined.append(&mut sys_segments);
+
+            combined.sort_by(|a, b| {
+                a.audio_start_time
+                    .unwrap_or(0.0)
+                    .partial_cmp(&b.audio_start_time.unwrap_or(0.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            for seg in &mut combined {
+                seg.id = format!("transcript-{}", uuid::Uuid::new_v4());
+            }
+
+            let max_duration = mic_dur.max(sys_dur);
+            (combined, max_duration, "mic.ogg".to_string())
         }
-    }
+        DetectedAudioTracks::Single(single_audio) => {
+            let filename = single_audio
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("audio.mp4")
+                .to_string();
 
-    let processable_count = processable_segments.len();
-    info!("Processing {} segments (after splitting)", processable_count);
+            let (segs, dur) = process_single_audio_track(
+                &app,
+                &meeting_id,
+                &single_audio,
+                whisper_engine.as_ref(),
+                parakeet_engine.as_ref(),
+                language.as_deref(),
+                "Audio",
+                true,
+                None,
+                5,
+                85,
+            )
+            .await?;
 
-    // Process each speech segment with progress updates
-    let mut all_transcripts: Vec<(String, f64, f64)> = Vec::new(); // (text, start_ms, end_ms)
-    let mut total_confidence = 0.0f32;
-
-    for (i, segment) in processable_segments.iter().enumerate() {
-        // Check for cancellation before each segment
-        if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
-            return Err(anyhow!("Retranscription cancelled"));
+            (segs, dur, filename)
         }
-
-        // Calculate progress (25% to 80% range for transcription)
-        let progress = 25 + ((i as f32 / processable_count as f32) * 55.0) as u32;
-        let segment_duration_sec = (segment.end_timestamp_ms - segment.start_timestamp_ms) / 1000.0;
-        emit_progress(
-            &app,
-            &meeting_id,
-            "transcribing",
-            progress,
-            &format!(
-                "Transcribing segment {} of {} ({:.1}s)...",
-                i + 1,
-                processable_count,
-                segment_duration_sec
-            ),
-        );
-
-        // Skip very short segments (< 100ms of audio = 1600 samples at 16kHz)
-        if segment.samples.len() < 1600 {
-            debug!("Skipping short segment {} with {} samples", i, segment.samples.len());
-            continue;
-        }
-
-        // Transcribe this segment
-        let (text, conf) = if use_parakeet {
-            let engine = parakeet_engine.as_ref().unwrap();
-            let text = engine
-                .transcribe_audio(segment.samples.clone())
-                .await
-                .map_err(|e| anyhow!("Parakeet transcription failed on segment {}: {}", i, e))?;
-            (text, 0.9f32)
-        } else {
-            let engine = whisper_engine.as_ref().unwrap();
-            let (text, conf, _) = engine
-                .transcribe_audio_with_confidence(segment.samples.clone(), language.clone())
-                .await
-                .map_err(|e| anyhow!("Whisper transcription failed on segment {}: {}", i, e))?;
-            (text, conf)
-        };
-
-        // Skip empty transcripts
-        let trimmed = text.trim();
-        if !trimmed.is_empty() {
-            debug!(
-                "Segment {}/{}: {:.1}s, conf={:.2}, text='{}'",
-                i + 1, processable_count, segment_duration_sec, conf,
-                if trimmed.len() > 80 { let mut end = 80; while !trimmed.is_char_boundary(end) { end -= 1; } &trimmed[..end] } else { trimmed }
-            );
-            all_transcripts.push((text, segment.start_timestamp_ms, segment.end_timestamp_ms));
-            total_confidence += conf;
-        } else {
-            debug!("Segment {}/{}: {:.1}s — empty transcription", i + 1, processable_count, segment_duration_sec);
-        }
-    }
-
-    let transcribed_count = all_transcripts.len();
-    let avg_confidence = if transcribed_count > 0 {
-        total_confidence / transcribed_count as f32
-    } else {
-        0.0
     };
 
-    info!(
-        "Transcription complete: {} segments transcribed out of {}, avg confidence: {:.2}",
-        transcribed_count, processable_count, avg_confidence
-    );
-
-    // Check for cancellation
     if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
         return Err(anyhow!("Retranscription cancelled"));
     }
 
-    emit_progress(&app, &meeting_id, "saving", 80, "Saving transcripts...");
-
-    // Create transcript segments with proper timestamps and speaker from diarization
-    let segments = create_transcript_segments_with_speaker(
-        &all_transcripts,
-        diarization_segments.as_deref(),
-    );
+    emit_progress(&app, &meeting_id, "saving", 85, "Saving transcripts...");
 
     // Save to database
     let app_state = app
         .try_state::<AppState>()
         .ok_or_else(|| anyhow!("App state not available"))?;
 
-    // Wrap delete+insert+update in a transaction to prevent data loss
+    // Wrap delete+insert in a transaction to prevent data loss
     let pool = app_state.db_manager.pool();
     let mut conn = pool.acquire().await.map_err(|e| anyhow!("DB error: {}", e))?;
     let mut tx = sqlx::Connection::begin(&mut *conn)
@@ -494,13 +597,6 @@ async fn run_retranscription<R: Runtime>(
     if let Err(e) = write_transcripts_json(&folder_path, &segments) {
         warn!("Failed to write transcripts.json: {}", e);
     }
-
-    // Find audio filename for metadata
-    let audio_filename = audio_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("audio.mp4")
-        .to_string();
 
     if let Err(e) = write_retranscription_metadata(
         &folder_path,
@@ -1073,5 +1169,35 @@ mod tests {
         assert_eq!(metadata["summary_language"], "fr");
         assert_eq!(metadata["custom_field"], "preserve me");
         assert!(metadata.get("detected_summary_language").is_none());
+    }
+
+    #[test]
+    fn test_detect_audio_tracks_dual() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mic.ogg"), b"fake_mic").unwrap();
+        std::fs::write(dir.path().join("system.ogg"), b"fake_sys").unwrap();
+
+        let tracks = detect_audio_tracks(dir.path()).unwrap();
+        match tracks {
+            DetectedAudioTracks::Dual { mic, system } => {
+                assert_eq!(mic.file_name().unwrap(), "mic.ogg");
+                assert_eq!(system.file_name().unwrap(), "system.ogg");
+            }
+            _ => panic!("Expected DetectedAudioTracks::Dual"),
+        }
+    }
+
+    #[test]
+    fn test_detect_audio_tracks_single_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("audio.mp4"), b"fake_audio").unwrap();
+
+        let tracks = detect_audio_tracks(dir.path()).unwrap();
+        match tracks {
+            DetectedAudioTracks::Single(single) => {
+                assert_eq!(single.file_name().unwrap(), "audio.mp4");
+            }
+            _ => panic!("Expected DetectedAudioTracks::Single"),
+        }
     }
 }

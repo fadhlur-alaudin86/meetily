@@ -33,9 +33,32 @@ pub fn encode_single_audio(
 
     debug!("Using FFmpeg at: {:?}", ffmpeg_path);
 
+    let is_ogg = output_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map_or(false, |ext| ext.eq_ignore_ascii_case("ogg"));
+
     let mut command = Command::new(ffmpeg_path);
-    command
-        .args([
+    if is_ogg {
+        command.args([
+            "-f",
+            "f32le",
+            "-ar",
+            &sample_rate.to_string(),
+            "-ac",
+            &channels.to_string(),
+            "-i",
+            "pipe:0",
+            "-c:a",
+            "libvorbis",
+            "-b:a",
+            "128k",
+            "-f",
+            "ogg",
+            output_path.to_str().unwrap(),
+        ]);
+    } else {
+        command.args([
             "-f",
             "f32le",
             "-ar",
@@ -55,7 +78,10 @@ pub fn encode_single_audio(
             "-f",
             "mp4",
             output_path.to_str().unwrap(),
-        ])
+        ]);
+    }
+
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

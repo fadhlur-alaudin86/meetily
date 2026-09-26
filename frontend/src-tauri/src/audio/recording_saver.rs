@@ -37,6 +37,10 @@ pub struct MeetingMetadata {
     pub duration_seconds: Option<f64>,
     pub devices: DeviceInfo,
     pub audio_file: String,
+    #[serde(default)]
+    pub mic_audio_file: Option<String>,
+    #[serde(default)]
+    pub sys_audio_file: Option<String>,
     pub transcript_file: String,
     pub sample_rate: u32,
     pub status: String,  // "recording", "completed", "error"
@@ -52,6 +56,8 @@ pub struct DeviceInfo {
 pub struct RecordingSaver {
     save_folder: Option<PathBuf>,
     incremental_saver: Option<Arc<AsyncMutex<IncrementalAudioSaver>>>,
+    mic_incremental_saver: Option<Arc<AsyncMutex<IncrementalAudioSaver>>>,
+    sys_incremental_saver: Option<Arc<AsyncMutex<IncrementalAudioSaver>>>,
     meeting_folder: Option<PathBuf>,
     meeting_name: Option<String>,
     metadata: Option<MeetingMetadata>,
@@ -64,6 +70,8 @@ impl RecordingSaver {
         Self {
             save_folder: None,
             incremental_saver: None,
+            mic_incremental_saver: None,
+            sys_incremental_saver: None,
             meeting_folder: None,
             meeting_name: None,
             metadata: None,
@@ -226,6 +234,127 @@ impl RecordingSaver {
         }
     }
 
+    /// Start accumulation with dual-track audio streams (separate mic and system audio)
+    pub fn start_accumulation_dual(
+        &mut self,
+        auto_save: bool,
+        mut mic_receiver: mpsc::UnboundedReceiver<AudioChunk>,
+        mut sys_receiver: mpsc::UnboundedReceiver<AudioChunk>,
+    ) {
+        if auto_save {
+            info!("Initializing dual-track incremental audio savers (auto-save ENABLED)");
+            if let Some(name) = self.meeting_name.clone() {
+                match self.initialize_meeting_folder_dual(&name, true) {
+                    Ok(()) => info!("Successfully initialized meeting folder with dual checkpoints"),
+                    Err(e) => error!("Failed to initialize dual meeting folder: {}", e),
+                }
+            }
+        } else {
+            info!("Starting dual recording without audio saving (auto-save DISABLED)");
+            if let Some(name) = self.meeting_name.clone() {
+                match self.initialize_meeting_folder_dual(&name, false) {
+                    Ok(()) => info!("Successfully initialized meeting folder (transcripts only)"),
+                    Err(e) => error!("Failed to initialize meeting folder: {}", e),
+                }
+            }
+        }
+
+        let is_saving_mic = self.is_saving.clone();
+        let mic_saver_arc = self.mic_incremental_saver.clone();
+        let save_audio = auto_save;
+
+        tokio::spawn(async move {
+            info!("Microphone accumulation task started (save_audio: {})", save_audio);
+            while let Some(chunk) = mic_receiver.recv().await {
+                let should_continue = is_saving_mic.lock().map_or(false, |guard| *guard);
+                if !should_continue {
+                    break;
+                }
+                if save_audio {
+                    if let Some(saver) = &mic_saver_arc {
+                        let mut guard = saver.lock().await;
+                        if let Err(e) = guard.add_chunk(chunk) {
+                            error!("Failed to add mic chunk to incremental saver: {}", e);
+                        }
+                    }
+                }
+            }
+            info!("Microphone accumulation task ended");
+        });
+
+        let is_saving_sys = self.is_saving.clone();
+        let sys_saver_arc = self.sys_incremental_saver.clone();
+
+        tokio::spawn(async move {
+            info!("System audio accumulation task started (save_audio: {})", save_audio);
+            while let Some(chunk) = sys_receiver.recv().await {
+                let should_continue = is_saving_sys.lock().map_or(false, |guard| *guard);
+                if !should_continue {
+                    break;
+                }
+                if save_audio {
+                    if let Some(saver) = &sys_saver_arc {
+                        let mut guard = saver.lock().await;
+                        if let Err(e) = guard.add_chunk(chunk) {
+                            error!("Failed to add sys chunk to incremental saver: {}", e);
+                        }
+                    }
+                }
+            }
+            info!("System audio accumulation task ended");
+        });
+
+        if let Ok(mut is_saving) = self.is_saving.lock() {
+            *is_saving = true;
+        }
+    }
+
+    /// Initialize meeting folder structure and metadata for dual-track audio
+    fn initialize_meeting_folder_dual(&mut self, meeting_name: &str, create_checkpoints: bool) -> Result<()> {
+        let base_folder = self
+            .save_folder
+            .clone()
+            .unwrap_or_else(super::recording_preferences::get_default_recordings_folder);
+
+        let meeting_folder = create_meeting_folder(&base_folder, meeting_name, create_checkpoints)?;
+
+        if create_checkpoints {
+            let mic_saver = IncrementalAudioSaver::with_options(meeting_folder.clone(), 48000, "mic", "mic.ogg")?;
+            let sys_saver = IncrementalAudioSaver::with_options(meeting_folder.clone(), 48000, "system", "system.ogg")?;
+            self.mic_incremental_saver = Some(Arc::new(AsyncMutex::new(mic_saver)));
+            self.sys_incremental_saver = Some(Arc::new(AsyncMutex::new(sys_saver)));
+            info!("Dual incremental audio savers initialized for meeting: {}", meeting_name);
+        } else {
+            info!("Skipped dual incremental audio savers (auto-save disabled)");
+        }
+
+        let metadata = MeetingMetadata {
+            version: "1.0".to_string(),
+            meeting_id: None,
+            meeting_name: Some(meeting_name.to_string()),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            completed_at: None,
+            duration_seconds: None,
+            devices: DeviceInfo {
+                microphone: None,
+                system_audio: None,
+            },
+            audio_file: if create_checkpoints { "mic.ogg".to_string() } else { "".to_string() },
+            mic_audio_file: if create_checkpoints { Some("mic.ogg".to_string()) } else { None },
+            sys_audio_file: if create_checkpoints { Some("system.ogg".to_string()) } else { None },
+            transcript_file: "transcripts.json".to_string(),
+            sample_rate: 48000,
+            status: "recording".to_string(),
+        };
+
+        self.write_metadata(&meeting_folder, &metadata)?;
+
+        self.meeting_folder = Some(meeting_folder);
+        self.metadata = Some(metadata);
+
+        Ok(())
+    }
+
     /// Initialize meeting folder structure and metadata
     ///
     /// # Arguments
@@ -263,6 +392,8 @@ impl RecordingSaver {
                 system_audio: None,
             },
             audio_file: if create_checkpoints { "audio.mp4".to_string() } else { "".to_string() },
+            mic_audio_file: None,
+            sys_audio_file: None,
             transcript_file: "transcripts.json".to_string(),
             sample_rate: 48000,
             status: "recording".to_string(),
@@ -378,7 +509,8 @@ impl RecordingSaver {
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
         // Check if incremental saver exists (indicates auto_save was enabled)
-        let should_save_audio = self.incremental_saver.is_some();
+        let is_dual = self.mic_incremental_saver.is_some() && self.sys_incremental_saver.is_some();
+        let should_save_audio = self.incremental_saver.is_some() || is_dual;
 
         if !should_save_audio {
             info!("⚠️  No audio saver initialized (auto-save was disabled) - skipping audio finalization");
@@ -386,8 +518,44 @@ impl RecordingSaver {
             return Ok(None);
         }
 
-        // Finalize incremental saver (merge checkpoints into final audio.mp4)
-        let final_audio_path = if let Some(saver_arc) = &self.incremental_saver {
+        // Finalize incremental savers (merge checkpoints into final audio files)
+        let final_audio_path = if is_dual {
+            info!("Finalizing dual audio savers (mic and system)");
+            let mic_saver_arc = self.mic_incremental_saver.clone().unwrap();
+            let sys_saver_arc = self.sys_incremental_saver.clone().unwrap();
+
+            let mut mic_saver = mic_saver_arc.lock().await;
+            let mic_path = match mic_saver.finalize().await {
+                Ok(path) => {
+                    info!("✅ Successfully finalized mic audio: {}", path.display());
+                    path
+                }
+                Err(e) => {
+                    error!("❌ Failed to finalize mic incremental saver: {}", e);
+                    return Err(format!("Failed to finalize mic audio: {}", e));
+                }
+            };
+
+            let mut sys_saver = sys_saver_arc.lock().await;
+            let _sys_path = match sys_saver.finalize().await {
+                Ok(path) => {
+                    info!("✅ Successfully finalized system audio: {}", path.display());
+                    path
+                }
+                Err(e) => {
+                    error!("❌ Failed to finalize system incremental saver: {}", e);
+                    return Err(format!("Failed to finalize system audio: {}", e));
+                }
+            };
+
+            if let Some(ref mut metadata) = self.metadata {
+                metadata.audio_file = "mic.ogg".to_string();
+                metadata.mic_audio_file = Some("mic.ogg".to_string());
+                metadata.sys_audio_file = Some("system.ogg".to_string());
+            }
+
+            mic_path
+        } else if let Some(saver_arc) = &self.incremental_saver {
             let mut saver = saver_arc.lock().await;
             match saver.finalize().await {
                 Ok(path) => {

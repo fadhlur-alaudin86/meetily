@@ -709,6 +709,8 @@ pub struct AudioPipeline {
     mixer: ProfessionalAudioMixer,
     // Recording sender for pre-mixed audio
     recording_sender_for_mixed: Option<mpsc::UnboundedSender<AudioChunk>>,
+    recording_sender_for_mic: Option<mpsc::UnboundedSender<AudioChunk>>,
+    recording_sender_for_sys: Option<mpsc::UnboundedSender<AudioChunk>>,
 }
 
 impl AudioPipeline {
@@ -775,6 +777,8 @@ impl AudioPipeline {
             ring_buffer,
             mixer,
             recording_sender_for_mixed: None,  // Will be set by manager
+            recording_sender_for_mic: None,
+            recording_sender_for_sys: None,
         })
     }
 
@@ -880,8 +884,26 @@ impl AudioPipeline {
                                 }
                             }
 
-                            // STEP 4: Send mixed audio for recording (WAV file)
-                            if let Some(ref sender) = self.recording_sender_for_mixed {
+                            // STEP 4: Send audio for recording
+                            if let (Some(ref mic_sender), Some(ref sys_sender)) = (&self.recording_sender_for_mic, &self.recording_sender_for_sys) {
+                                let mic_chunk = AudioChunk {
+                                    data: mic_window.clone(),
+                                    sample_rate: self.sample_rate,
+                                    timestamp: chunk.timestamp,
+                                    chunk_id: self.chunk_id_counter,
+                                    device_type: DeviceType::Microphone,
+                                };
+                                let _ = mic_sender.send(mic_chunk);
+
+                                let sys_chunk = AudioChunk {
+                                    data: sys_window.clone(),
+                                    sample_rate: self.sample_rate,
+                                    timestamp: chunk.timestamp,
+                                    chunk_id: self.chunk_id_counter,
+                                    device_type: DeviceType::System,
+                                };
+                                let _ = sys_sender.send(sys_chunk);
+                            } else if let Some(ref sender) = self.recording_sender_for_mixed {
                                 let recording_chunk = AudioChunk {
                                     data: mixed_with_gain.clone(),
                                     sample_rate: self.sample_rate,
@@ -977,6 +999,7 @@ impl AudioPipelineManager {
         vad_redemption_time_ms: u32,
         sample_rate: u32,
         recording_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
+        dual_recording_senders: Option<(mpsc::UnboundedSender<AudioChunk>, mpsc::UnboundedSender<AudioChunk>)>,
         mic_device_name: String,
         mic_device_kind: super::device_detection::InputDeviceKind,
         system_device_name: String,
@@ -1005,9 +1028,15 @@ impl AudioPipelineManager {
         )?;
         state.set_audio_sender(audio_sender.clone());
 
-        // CRITICAL FIX: Connect recording sender to receive pre-mixed audio
-        // This ensures both mic AND system audio are captured in recordings
-        pipeline.recording_sender_for_mixed = recording_sender;
+        // Connect recording senders: either dual-track or mixed
+        if let Some((mic_s, sys_s)) = dual_recording_senders {
+            pipeline.recording_sender_for_mic = Some(mic_s);
+            pipeline.recording_sender_for_sys = Some(sys_s);
+            info!("Audio pipeline configured for dual-track recording (mic + system)");
+        } else {
+            pipeline.recording_sender_for_mixed = recording_sender;
+            info!("Audio pipeline configured for single-track mixed recording");
+        }
 
         let handle = tokio::spawn(async move {
             pipeline.run().await

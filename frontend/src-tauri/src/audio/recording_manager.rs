@@ -235,7 +235,23 @@ impl RecordingManager {
 
         // Set up transcription channel
         let (transcription_sender, transcription_receiver) = mpsc::unbounded_channel::<AudioChunk>();
-        let (recording_sender, recording_receiver) = mpsc::unbounded_channel::<AudioChunk>();
+
+        // Set up recording channels: dual-track if both devices present, otherwise single mixed channel
+        let is_dual_track = microphone_device.is_some() && system_device.is_some();
+        let (recording_sender, recording_receiver) = if !is_dual_track {
+            let (tx, rx) = mpsc::unbounded_channel::<AudioChunk>();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        let (dual_senders, dual_receivers) = if is_dual_track {
+            let (mic_tx, mic_rx) = mpsc::unbounded_channel::<AudioChunk>();
+            let (sys_tx, sys_rx) = mpsc::unbounded_channel::<AudioChunk>();
+            (Some((mic_tx, sys_tx)), Some((mic_rx, sys_rx)))
+        } else {
+            (None, None)
+        };
 
         // Reset live system diarizer state for new recording session
         crate::audio::diarization::reset_live_system_diarizer();
@@ -272,14 +288,13 @@ impl RecordingManager {
               vad_redemption_time_ms, system_device.is_some());
 
         // Start the audio processing pipeline with FFmpeg adaptive mixer
-        // Pipeline will: 1) Mix mic+system audio with adaptive buffering, 2) Send mixed to recording_sender,
-        // 3) Apply VAD and send speech segments to transcription
         if let Err(error) = self.pipeline_manager.start(
             self.state.clone(),
             transcription_sender,
             vad_redemption_time_ms,
             48000, // 48kHz sample rate
-            Some(recording_sender), // CRITICAL: Pass recording sender to receive pre-mixed audio
+            recording_sender,
+            dual_senders,
             mic_name,
             mic_kind,
             sys_name,
@@ -289,7 +304,11 @@ impl RecordingManager {
             return Err(RecordingStartError::TranscriptionRuntime(error));
         }
 
-        self.recording_saver.start_accumulation(auto_save, recording_receiver);
+        if let Some((mic_rx, sys_rx)) = dual_receivers {
+            self.recording_saver.start_accumulation_dual(auto_save, mic_rx, sys_rx);
+        } else if let Some(rx) = recording_receiver {
+            self.recording_saver.start_accumulation(auto_save, rx);
+        }
         self.recording_saver.set_device_info(
             microphone_device.as_ref().map(|d| d.name.clone()),
             system_device.as_ref().map(|d| d.name.clone())
