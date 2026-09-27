@@ -19,7 +19,7 @@ tokio = { version = "1.32.0", features = ["full"] }
 
 [patch.crates-io]
 cpal = { git = "https://github.com/RustAudio/cpal", rev = "51c3b43" }
-esaxx-rs = { git = "https://github.com/thewh1teagle/esaxx-rs.git", branch = "feat/dynamic-msvc-link" }
+# esaxx-rs patch removed due to unavailable repository; Cargo will use the crate version from crates.io
 
 [profile.release]
 codegen-units = 1

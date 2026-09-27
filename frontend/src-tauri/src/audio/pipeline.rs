@@ -213,7 +213,7 @@ pub struct AudioCapture {
     channels: u16,
     chunk_counter: Arc<std::sync::atomic::AtomicU64>,
     device_type: DeviceType,
-    recording_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
+    _recording_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
     needs_resampling: bool,  // Flag if resampling is required
     // CRITICAL FIX: Persistent resampler to preserve energy across chunks
     resampler: Arc<std::sync::Mutex<Option<SincFixedIn<f32>>>>,
@@ -385,7 +385,7 @@ impl AudioCapture {
             channels,
             chunk_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             device_type,
-            recording_sender,
+            _recording_sender: recording_sender,
             needs_resampling,
             resampler: Arc::new(std::sync::Mutex::new(resampler)),
             resampler_input_buffer: Arc::new(std::sync::Mutex::new(Vec::with_capacity(RESAMPLER_CHUNK_SIZE * 2))),
@@ -695,7 +695,7 @@ impl AudioCapture {
 pub struct AudioPipeline {
     receiver: mpsc::UnboundedReceiver<AudioChunk>,
     transcription_sender: mpsc::UnboundedSender<AudioChunk>,
-    state: Arc<RecordingState>,
+    _state: Arc<RecordingState>,
     vad_processor: ContinuousVadProcessor,
     sample_rate: u32,
     chunk_id_counter: u64,
@@ -764,7 +764,7 @@ impl AudioPipeline {
         Ok(Self {
             receiver,
             transcription_sender,
-            state,
+            _state: state,
             vad_processor,
             sample_rate,
             chunk_id_counter: 0,
