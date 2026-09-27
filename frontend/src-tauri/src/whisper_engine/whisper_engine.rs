@@ -132,15 +132,11 @@ impl WhisperEngine {
             // Development: Use frontend/models or backend directories
             // Production: Use system directories (should be overridden by caller)
             if cfg!(debug_assertions) {
-                // Development mode - try frontend and backend directories
+                // Development mode - try frontend models directory
                 if current_dir.join("models").exists() {
                     current_dir.join("models")
                 } else if current_dir.join("../models").exists() {
                     current_dir.join("../models")
-                } else if current_dir.join("backend/whisper-server-package/models").exists() {
-                    current_dir.join("backend/whisper-server-package/models")
-                } else if current_dir.join("../backend/whisper-server-package/models").exists() {
-                    current_dir.join("../backend/whisper-server-package/models")
                 } else {
                     // Create models directory in current directory for development
                     current_dir.join("models")
