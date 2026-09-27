@@ -40,9 +40,19 @@ pub async fn api_get_backup_status<R: Runtime>(
     meeting_id: String,
 ) -> Result<Option<MeetingBackup>, String> {
     let pool = state.db_manager.pool();
-    BackupsRepository::get_backup(pool, &meeting_id)
+    let backup = BackupsRepository::get_backup(pool, &meeting_id)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    let Some(backup) = backup else {
+        return Ok(None);
+    };
+
+    Ok(BackupService::reconcile_backup_records(pool, vec![backup])
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .next())
 }
 
 #[tauri::command]
@@ -51,7 +61,10 @@ pub async fn api_get_all_backup_statuses<R: Runtime>(
     state: State<'_, AppState>,
 ) -> Result<Vec<MeetingBackup>, String> {
     let pool = state.db_manager.pool();
-    BackupsRepository::get_all_backups(pool)
+    let backups = BackupsRepository::get_all_backups(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    BackupService::reconcile_backup_records(pool, backups)
         .await
         .map_err(|e| e.to_string())
 }

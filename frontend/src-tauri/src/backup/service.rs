@@ -167,6 +167,33 @@ impl BackupService {
         Ok((has_audio, has_summary))
     }
 
+    /// Splits backup records into those whose zip still exists on disk and those that do not.
+    pub fn split_present_and_missing(
+        backups: Vec<MeetingBackup>,
+    ) -> (Vec<MeetingBackup>, Vec<MeetingBackup>) {
+        backups
+            .into_iter()
+            .partition(|backup| std::path::Path::new(&backup.backup_path).is_file())
+    }
+
+    /// Drops SQLite rows whose zip files were deleted, and returns only still-present backups.
+    pub async fn reconcile_backup_records(
+        pool: &SqlitePool,
+        backups: Vec<MeetingBackup>,
+    ) -> Result<Vec<MeetingBackup>> {
+        let (present, missing) = Self::split_present_and_missing(backups);
+        for backup in missing {
+            info!(
+                "Backup file missing for meeting {}, clearing status: {}",
+                backup.meeting_id, backup.backup_path
+            );
+            BackupsRepository::delete_backup(pool, &backup.meeting_id)
+                .await
+                .map_err(|e| anyhow!("Failed to clear missing backup for {}: {}", backup.meeting_id, e))?;
+        }
+        Ok(present)
+    }
+
     /// Recursively walks `current_dir` relative to `base`, adding files to the zip writer.
     fn walk_and_pack(
         base: &std::path::Path,
@@ -356,5 +383,44 @@ mod tests {
         let mut content = Vec::new();
         entry.read_to_end(&mut content).unwrap();
         assert_eq!(content, expected, "file content must be preserved exactly");
+    }
+
+    fn sample_backup(meeting_id: &str, path: &std::path::Path) -> MeetingBackup {
+        MeetingBackup {
+            meeting_id: meeting_id.to_string(),
+            backup_path: path.to_string_lossy().to_string(),
+            status: "ok".to_string(),
+            backed_up_at: "2026-01-01T00:00:00Z".to_string(),
+            has_audio: true,
+            has_summary: true,
+        }
+    }
+
+    #[test]
+    fn test_split_keeps_existing_zip_and_flags_deleted_zip() {
+        let dir = TempDir::new().unwrap();
+        let present_path = dir.path().join("present_backup.zip");
+        std::fs::write(&present_path, b"zip").unwrap();
+        let missing_path = dir.path().join("deleted_backup.zip");
+
+        let (present, missing) = BackupService::split_present_and_missing(vec![
+            sample_backup("keep", &present_path),
+            sample_backup("gone", &missing_path),
+        ]);
+
+        assert_eq!(present.len(), 1);
+        assert_eq!(present[0].meeting_id, "keep");
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].meeting_id, "gone");
+    }
+
+    #[test]
+    fn test_split_treats_directory_as_missing() {
+        let dir = TempDir::new().unwrap();
+        let (present, missing) =
+            BackupService::split_present_and_missing(vec![sample_backup("dir", dir.path())]);
+
+        assert!(present.is_empty());
+        assert_eq!(missing.len(), 1);
     }
 }
