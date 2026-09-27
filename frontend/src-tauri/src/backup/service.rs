@@ -5,7 +5,7 @@ use sqlx::SqlitePool;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Emitter, Runtime};
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
 
@@ -84,6 +84,12 @@ impl BackupService {
 
         BackupsRepository::upsert_backup(pool, &backup_record).await?;
 
+        // Notify frontend so sidebar badges and settings stats update without a restart.
+        // Covers all call paths: manual single, backup-all loop, and auto-backup spawn.
+        if let Err(e) = app.emit("backup-updated", &backup_record) {
+            warn!("Failed to emit backup-updated for meeting {}: {}", meeting_id, e);
+        }
+
         info!(
             "Successfully created backup for meeting {}: status={}",
             meeting_id, backup_record.status
@@ -105,6 +111,18 @@ impl BackupService {
                     Ok(backup) => results.push(backup),
                     Err(e) => {
                         warn!("Skipped meeting {} during backup_all: {}", meeting.id, e);
+                        if let Err(emit_err) = app.emit(
+                            "backup-failed",
+                            serde_json::json!({
+                                "meeting_id": meeting.id,
+                                "error": e.to_string(),
+                            }),
+                        ) {
+                            warn!(
+                                "Failed to emit backup-failed for meeting {}: {}",
+                                meeting.id, emit_err
+                            );
+                        }
                     }
                 }
             }

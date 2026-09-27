@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useMemo, useEffect, useCallback } from 'react';
-import { ChevronDown, ChevronRight, File, Settings, ChevronLeftCircle, ChevronRightCircle, Calendar, StickyNote, Home, Trash2, Mic, Square, Plus, Search, Pencil, NotebookPen, SearchIcon, X, Upload, CheckCircle2, Clock, MinusCircle, Archive, RefreshCw } from 'lucide-react';
+import { ChevronDown, ChevronRight, File, Settings, ChevronLeftCircle, ChevronRightCircle, Calendar, StickyNote, Home, Trash2, Mic, Square, Plus, Search, Pencil, NotebookPen, SearchIcon, X, Upload, CheckCircle2, Clock, MinusCircle, Archive, RefreshCw, AlertCircle } from 'lucide-react';
 import { useRouter, usePathname } from 'next/navigation';
 import { useSidebar } from './SidebarProvider';
 import type { CurrentMeeting } from '@/components/Sidebar/SidebarProvider';
@@ -16,6 +16,7 @@ import { toast } from 'sonner';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 import { useImportDialog } from '@/contexts/ImportDialogContext';
 import { useConfig } from '@/contexts/ConfigContext';
+import { useBackupStatus } from '@/contexts/BackupStatusContext';
 import { MeetingBackup } from '@/types';
 
 import {
@@ -105,32 +106,16 @@ const Sidebar: React.FC = () => {
 
 
   const [deleteModalState, setDeleteModalState] = useState<{ isOpen: boolean; itemId: string | null }>({ isOpen: false, itemId: null });
-  const [backupStatuses, setBackupStatuses] = useState<Record<string, MeetingBackup>>({});
+  // Shared backup status: fetched once by the provider, kept fresh by
+  // backend `backup-updated`/`backup-failed` events and window focus.
+  const { statuses: backupStatuses } = useBackupStatus();
   const [backingUpId, setBackingUpId] = useState<string | null>(null);
-
-  // Fetch all backup statuses
-  const fetchBackupStatuses = useCallback(async () => {
-    try {
-      const list = await invoke<MeetingBackup[]>('api_get_all_backup_statuses');
-      const map: Record<string, MeetingBackup> = {};
-      for (const item of list) {
-        map[item.meeting_id] = item;
-      }
-      setBackupStatuses(map);
-    } catch (error) {
-      console.error('Failed to fetch backup statuses in Sidebar:', error);
-    }
-  }, []);
-
-  useEffect(() => {
-    fetchBackupStatuses();
-  }, [fetchBackupStatuses, meetings]);
 
   const handleManualBackup = async (meetingId: string) => {
     setBackingUpId(meetingId);
     try {
       const result = await invoke<MeetingBackup>('api_backup_meeting', { meetingId });
-      setBackupStatuses(prev => ({ ...prev, [meetingId]: result }));
+      // Status map updates automatically via the backend `backup-updated` event.
       toast.success('Backup created successfully', {
         description: `Status: ${result.status === 'ok' ? 'Complete' : 'Partial'}`
       });
@@ -672,6 +657,8 @@ const Sidebar: React.FC = () => {
                           <CheckCircle2 className="w-3.5 h-3.5 text-green-600" />
                         ) : backupStatuses[item.id]?.status === 'partial' ? (
                           <Clock className="w-3.5 h-3.5 text-amber-500" />
+                        ) : backupStatuses[item.id]?.status === 'failed' ? (
+                          <AlertCircle className="w-3.5 h-3.5 text-red-500" />
                         ) : (
                           <MinusCircle className="w-3.5 h-3.5 text-gray-300 group-hover:text-gray-400" />
                         )}
@@ -685,6 +672,8 @@ const Sidebar: React.FC = () => {
                           ? 'Backup OK (Audio, Transcripts, Summary)'
                           : backupStatuses[item.id]?.status === 'partial'
                           ? 'Partial Backup (Transcripts & Audio only. Click to back up)'
+                          : backupStatuses[item.id]?.status === 'failed'
+                          ? 'Backup Failed (Click to retry)'
                           : 'No Backup (Click to back up now)'}
                       </p>
                     </TooltipContent>

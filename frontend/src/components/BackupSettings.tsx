@@ -4,6 +4,7 @@ import { FolderOpen, RefreshCw, Archive, CheckCircle2, Clock, AlertCircle } from
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import { BackupPreferences, MeetingBackup } from '@/types';
+import { useBackupStatus } from '@/contexts/BackupStatusContext';
 
 export function BackupSettings() {
   const [preferences, setPreferences] = useState<BackupPreferences>({
@@ -13,11 +14,9 @@ export function BackupSettings() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [backingUpAll, setBackingUpAll] = useState(false);
-  const [backupStats, setBackupStats] = useState<{ ok: number; partial: number; failed: number }>({
-    ok: 0,
-    partial: 0,
-    failed: 0,
-  });
+  // Live counters: derived from the shared status map, refreshed by
+  // backend events and window focus (no local fetch needed).
+  const { stats: backupStats } = useBackupStatus();
 
   const loadPreferences = useCallback(async () => {
     try {
@@ -31,25 +30,9 @@ export function BackupSettings() {
     }
   }, []);
 
-  const loadBackupStats = useCallback(async () => {
-    try {
-      const statuses = await invoke<MeetingBackup[]>('api_get_all_backup_statuses');
-      const stats = { ok: 0, partial: 0, failed: 0 };
-      for (const item of statuses) {
-        if (item.status === 'ok') stats.ok++;
-        else if (item.status === 'partial') stats.partial++;
-        else if (item.status === 'failed') stats.failed++;
-      }
-      setBackupStats(stats);
-    } catch (error) {
-      console.error('Failed to load backup statistics:', error);
-    }
-  }, []);
-
   useEffect(() => {
     loadPreferences();
-    loadBackupStats();
-  }, [loadPreferences, loadBackupStats]);
+  }, [loadPreferences]);
 
   const handleAutoBackupToggle = async (enabled: boolean) => {
     const updated = { ...preferences, auto_backup: enabled };
@@ -106,7 +89,7 @@ export function BackupSettings() {
       toast.success('Backup complete', {
         description: `Successfully backed up ${results.length} meeting(s).`,
       });
-      await loadBackupStats();
+      // Status counters update automatically via backend `backup-updated` events.
     } catch (error) {
       console.error('Failed to back up all meetings:', error);
       toast.error('Backup all failed', {
