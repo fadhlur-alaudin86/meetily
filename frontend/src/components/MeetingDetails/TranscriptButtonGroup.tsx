@@ -1,9 +1,10 @@
 "use client";
 
 import { useState, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
 import { Button } from '@/components/ui/button';
 import { ButtonGroup } from '@/components/ui/button-group';
-import { Copy, FolderOpen, RefreshCw } from 'lucide-react';
+import { Copy, FolderOpen, NotebookPen, RefreshCw } from 'lucide-react';
 import Analytics from '@/lib/analytics';
 import { RetranscribeDialog } from './RetranscribeDialog';
 import { useConfig } from '@/contexts/ConfigContext';
@@ -28,6 +29,7 @@ export function TranscriptButtonGroup({
   onRefetchTranscripts,
 }: TranscriptButtonGroupProps) {
   const { betaFeatures } = useConfig();
+  const router = useRouter();
   const [showRetranscribeDialog, setShowRetranscribeDialog] = useState(false);
 
   const handleRetranscribeComplete = useCallback(async () => {
@@ -68,6 +70,22 @@ export function TranscriptButtonGroup({
           <FolderOpen className="@[22rem]:mr-2" size={18} />
           <span className="hidden @[22rem]:inline">Recording</span>
         </Button>
+
+        {meetingId && (
+          <Button
+            size="sm"
+            variant="outline"
+            className="px-2 @[22rem]:px-4"
+            onClick={() => {
+              Analytics.trackButtonClick('open_notes', 'meeting_details');
+              router.push(`/notes?id=${meetingId}`);
+            }}
+            title="Open Notes"
+          >
+            <NotebookPen className="@[22rem]:mr-2" size={18} />
+            <span className="hidden @[22rem]:inline">Notes</span>
+          </Button>
+        )}
 
         {betaFeatures.importAndRetranscribe && meetingId && meetingFolderPath && (
           <Button

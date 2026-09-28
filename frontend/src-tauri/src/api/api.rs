@@ -6,9 +6,9 @@ use tauri_plugin_store::StoreExt;
 
 use crate::{
     database::{
-        models::MeetingModel,
+        models::{MeetingModel, MeetingNotes},
         repositories::{
-            meeting::MeetingsRepository, setting::SettingsRepository,
+            meeting::MeetingsRepository, notes::NotesRepository, setting::SettingsRepository,
             transcript::TranscriptsRepository,
         },
     },
@@ -775,6 +775,18 @@ pub async fn api_delete_meeting<R: Runtime>(
     match MeetingsRepository::delete_meeting(pool, &meeting_id).await {
         Ok(true) => {
             log_info!("Successfully deleted meeting {}", meeting_id);
+            // meeting_notes declares ON DELETE CASCADE, but PRAGMA foreign_keys
+            // is off, so the row must be cleared here explicitly. The delete
+            // lives in this command (not in MeetingsRepository) because
+            // restore-Replace relies on the repository leaving notes intact
+            // when the archive carries none.
+            if let Err(e) = sqlx::query("DELETE FROM meeting_notes WHERE meeting_id = ?")
+                .bind(&meeting_id)
+                .execute(pool)
+                .await
+            {
+                log_warn!("Failed to delete notes for meeting {}: {}", meeting_id, e);
+            }
             if let Some(folder_str) = folder_path_to_delete {
                 let folder_path = std::path::Path::new(&folder_str);
                 if folder_path.exists() && folder_path.is_dir() {
@@ -865,6 +877,87 @@ pub async fn api_get_meeting_metadata<R: Runtime>(
             Err(format!("Failed to retrieve meeting metadata: {}", e))
         }
     }
+}
+
+/// Gets the user notes for a meeting (None when no note exists yet)
+#[tauri::command]
+pub async fn api_get_meeting_notes<R: Runtime>(
+    _app: AppHandle<R>,
+    meeting_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<MeetingNotes>, String> {
+    log_info!(
+        "api_get_meeting_notes called for meeting_id: {}",
+        meeting_id
+    );
+
+    NotesRepository::get(state.db_manager.pool(), &meeting_id)
+        .await
+        .map_err(|e| {
+            log_error!("Error retrieving notes for {}: {}", meeting_id, e);
+            e.to_string()
+        })
+}
+
+/// Saves (or clears) the user notes for a meeting.
+///
+/// An empty markdown after trim clears the note (the row is removed so
+/// backups never pack empty notes); markdown `None` with JSON content keeps
+/// the note when the markdown conversion failed client-side. A successful
+/// write triggers a fire-and-forget auto-backup so the archive reflects the
+/// new `db.json` state.
+#[tauri::command]
+pub async fn api_save_meeting_notes<R: Runtime>(
+    app: AppHandle<R>,
+    meeting_id: String,
+    notes_markdown: Option<String>,
+    notes_json: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<MeetingNotes>, String> {
+    log_info!(
+        "api_save_meeting_notes called for meeting_id: {}",
+        meeting_id
+    );
+    let pool = state.db_manager.pool();
+
+    // Notes only belong to an existing meeting.
+    MeetingsRepository::get_meeting_metadata(pool, &meeting_id)
+        .await
+        .map_err(|e| {
+            log_error!("Error resolving meeting {} for notes: {}", meeting_id, e);
+            e.to_string()
+        })?
+        .ok_or_else(|| {
+            log_warn!("Meeting not found for notes save: {}", meeting_id);
+            format!("Meeting not found: {}", meeting_id)
+        })?;
+
+    let markdown = notes_markdown.as_deref();
+    let json = notes_json.as_deref();
+
+    let saved = if NotesRepository::is_clear_request(markdown, json) {
+        NotesRepository::delete(pool, &meeting_id)
+            .await
+            .map_err(|e| {
+                log_error!("Error clearing notes for {}: {}", meeting_id, e);
+                e.to_string()
+            })?;
+        log_info!("Notes cleared for meeting {}", meeting_id);
+        None
+    } else {
+        let row = NotesRepository::upsert(pool, &meeting_id, markdown, json)
+            .await
+            .map_err(|e| {
+                log_error!("Error saving notes for {}: {}", meeting_id, e);
+                e.to_string()
+            })?;
+        log_info!("Notes saved for meeting {}", meeting_id);
+        Some(row)
+    };
+
+    crate::backup::BackupService::trigger_auto_backup(app, pool.clone(), meeting_id);
+
+    Ok(saved)
 }
 
 /// Get paginated transcripts for a meeting

@@ -11,8 +11,9 @@ import { SummaryGeneratorButtonGroup } from './SummaryGeneratorButtonGroup';
 import { SummaryUpdaterButtonGroup } from './SummaryUpdaterButtonGroup';
 import Analytics from '@/lib/analytics';
 import { useEffect, useRef, useState, RefObject } from 'react';
+import { useRouter } from 'next/navigation';
 import { toast } from 'sonner';
-import { Languages, ChevronDown } from 'lucide-react';
+import { Languages, ChevronDown, NotebookPen } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover';
 import { LanguagePickerPopover } from '@/components/LanguagePickerPopover';
@@ -106,6 +107,7 @@ export function SummaryPanel({
   } | null>(null);
   activeMeetingIdRef.current = meeting.id;
   const { addRecent } = useRecentLanguages();
+  const router = useRouter();
 
   const effectiveLangLabel = summaryLang ? labelForCode(summaryLang) : 'Auto';
   const isLocalFallbackLanguage = summaryLangStorage === 'local_fallback';
@@ -279,6 +281,21 @@ export function SummaryPanel({
               />
             </div>
           )}
+
+          <div className="flex-shrink-0">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                Analytics.trackButtonClick('open_notes', 'meeting_details');
+                router.push(`/notes?id=${meeting.id}`);
+              }}
+              title="Open Notes"
+            >
+              <NotebookPen className="mr-2" size={18} />
+              Notes
+            </Button>
+          </div>
         </div>
       </div>
 

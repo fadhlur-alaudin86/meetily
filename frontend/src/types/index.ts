@@ -187,3 +187,12 @@ export interface RestoreResult {
   restored_notes: boolean;
   backup: MeetingBackup;
 }
+
+/** Per-meeting user notes row (meeting_notes table). */
+export interface MeetingNotes {
+  meeting_id: string;
+  notes_markdown: string | null;
+  notes_json: string | null;
+  created_at: string;
+  updated_at: string;
+}

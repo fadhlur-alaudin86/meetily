@@ -139,3 +139,13 @@ pub struct MeetingBackup {
     pub has_audio: bool,
     pub has_summary: bool,
 }
+
+/// Per-meeting user notes: markdown plus the matching BlockNote JSON.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct MeetingNotes {
+    pub meeting_id: String,
+    pub notes_markdown: Option<String>,
+    pub notes_json: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
