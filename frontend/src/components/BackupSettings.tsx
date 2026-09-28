@@ -1,10 +1,19 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { Switch } from '@/components/ui/switch';
-import { FolderOpen, RefreshCw, Archive, CheckCircle2, Clock, AlertCircle } from 'lucide-react';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
+import { FolderOpen, RefreshCw, Archive, CheckCircle2, Clock, AlertCircle, RotateCcw, Copy, Replace } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
-import { BackupPreferences, MeetingBackup } from '@/types';
+import { BackupPreferences, MeetingBackup, BackupInspection, RestoreMode, RestoreResult } from '@/types';
 import { useBackupStatus } from '@/contexts/BackupStatusContext';
+import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 
 export function BackupSettings() {
   const [preferences, setPreferences] = useState<BackupPreferences>({
@@ -14,9 +23,14 @@ export function BackupSettings() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [backingUpAll, setBackingUpAll] = useState(false);
+  // Restore flow: picked archive awaiting a conflict decision (or null).
+  const [restoreInfo, setRestoreInfo] = useState<BackupInspection | null>(null);
+  const [pickingRestore, setPickingRestore] = useState(false);
+  const [restoring, setRestoring] = useState(false);
   // Live counters: derived from the shared status map, refreshed by
   // backend events and window focus (no local fetch needed).
   const { stats: backupStats } = useBackupStatus();
+  const { refetchMeetings } = useSidebar();
 
   const loadPreferences = useCallback(async () => {
     try {
@@ -97,6 +111,59 @@ export function BackupSettings() {
       });
     } finally {
       setBackingUpAll(false);
+    }
+  };
+
+  const performRestore = useCallback(
+    async (zipPath: string, mode: RestoreMode) => {
+      setRestoring(true);
+      try {
+        const result = await invoke<RestoreResult>('api_restore_meeting', {
+          zipPath,
+          mode,
+        });
+        toast.success('Meeting restored', {
+          description: `${result.title} — ${result.segment_count} transcript segment(s)${
+            result.restored_summary ? ', summary included' : ''
+          }`,
+        });
+        setRestoreInfo(null);
+        // Sidebar meeting list refresh; badges/stats follow the
+        // backend `backup-updated` event emitted by the restore command.
+        await refetchMeetings();
+      } catch (error) {
+        console.error('Failed to restore meeting:', error);
+        toast.error('Restore failed', {
+          description: error instanceof Error ? error.message : String(error),
+        });
+      } finally {
+        setRestoring(false);
+      }
+    },
+    [refetchMeetings]
+  );
+
+  const handleRestoreClick = async () => {
+    setPickingRestore(true);
+    try {
+      const zipPath = await invoke<string | null>('api_select_backup_zip');
+      if (!zipPath) {
+        return;
+      }
+      const info = await invoke<BackupInspection>('api_inspect_backup', { zipPath });
+      if (info.meeting_id_in_db) {
+        // Conflict: ask the user how to proceed.
+        setRestoreInfo(info);
+        return;
+      }
+      await performRestore(zipPath, 'fresh');
+    } catch (error) {
+      console.error('Failed to inspect backup archive:', error);
+      toast.error('Restore failed', {
+        description: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      setPickingRestore(false);
     }
   };
 
@@ -216,6 +283,100 @@ export function BackupSettings() {
           </button>
         </div>
       </div>
+
+      {/* Restore from Backup */}
+      <div className="p-4 border rounded-lg space-y-3">
+        <div>
+          <div className="font-medium text-sm text-gray-900">Restore from Backup</div>
+          <p className="text-xs text-gray-500 mt-0.5">
+            Import a meeting archive back into Meetily: folder files (audio, transcripts, summary) are
+            extracted and the local database rows are rebuilt — no re-transcription needed.
+          </p>
+        </div>
+        <button
+          onClick={handleRestoreClick}
+          disabled={pickingRestore || restoring}
+          className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-700 rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
+        >
+          <RotateCcw className="w-4 h-4" />
+          {pickingRestore
+            ? 'Selecting archive...'
+            : restoring
+              ? 'Restoring...'
+              : 'Restore from Backup...'}
+        </button>
+      </div>
+
+      {/* Restore conflict dialog */}
+      <Dialog open={restoreInfo !== null} onOpenChange={(open) => !open && setRestoreInfo(null)}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Meeting already exists</DialogTitle>
+            <DialogDescription>
+              The archive targets a meeting that is already in the local database. Choose how to
+              proceed.
+            </DialogDescription>
+          </DialogHeader>
+          {restoreInfo && (
+            <div className="space-y-3 text-sm">
+              <div className="p-3 bg-gray-50 border border-gray-200 rounded-md space-y-1">
+                <div>
+                  <span className="text-gray-500">Title:</span>{' '}
+                  <span className="font-medium">{restoreInfo.title}</span>
+                </div>
+                <div>
+                  <span className="text-gray-500">Meeting ID:</span>{' '}
+                  <span className="font-mono text-xs">{restoreInfo.meeting_id}</span>
+                </div>
+                <div>
+                  <span className="text-gray-500">Contents:</span>{' '}
+                  {restoreInfo.segment_count} transcript segment(s)
+                  {restoreInfo.has_summary ? ', summary' : ''}
+                  {restoreInfo.has_audio ? ', audio' : ''}
+                </div>
+              </div>
+              <div className="space-y-2 text-xs text-gray-600">
+                <p>
+                  <span className="font-medium text-gray-900">Replace existing:</span> transcript and
+                  summary rows are rebuilt from the archive. The current folder is renamed to{' '}
+                  <code className="bg-gray-100 px-1 rounded">*.replaced-&lt;timestamp&gt;</code>{' '}
+                  instead of being deleted.
+                </p>
+                <p>
+                  <span className="font-medium text-gray-900">Keep both:</span> restore as a new
+                  meeting with the title suffix <em>(restored)</em>; the existing meeting stays
+                  untouched.
+                </p>
+              </div>
+            </div>
+          )}
+          <DialogFooter className="gap-2 sm:gap-2">
+            <button
+              onClick={() => setRestoreInfo(null)}
+              disabled={restoring}
+              className="px-3 py-2 text-sm text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50 transition-colors disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={() => restoreInfo && performRestore(restoreInfo.zip_path, 'keep_both')}
+              disabled={restoring}
+              className="flex items-center gap-1.5 px-3 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-md transition-colors disabled:opacity-50"
+            >
+              <Copy className="w-4 h-4" />
+              {restoring ? 'Restoring...' : 'Keep both'}
+            </button>
+            <button
+              onClick={() => restoreInfo && performRestore(restoreInfo.zip_path, 'replace')}
+              disabled={restoring}
+              className="flex items-center gap-1.5 px-3 py-2 text-sm font-medium text-white bg-red-600 hover:bg-red-700 rounded-md transition-colors disabled:opacity-50"
+            >
+              <Replace className="w-4 h-4" />
+              {restoring ? 'Restoring...' : 'Replace existing'}
+            </button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

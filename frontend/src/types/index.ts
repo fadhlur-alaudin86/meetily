@@ -161,3 +161,26 @@ export interface BackupPreferences {
   backup_folder: string;
   auto_backup: boolean;
 }
+
+export interface BackupInspection {
+  zip_path: string;
+  title: string;
+  created_at: string;
+  meeting_id: string | null;
+  has_audio: boolean;
+  has_summary: boolean;
+  has_transcripts: boolean;
+  segment_count: number;
+  meeting_id_in_db: boolean;
+}
+
+export type RestoreMode = 'fresh' | 'replace' | 'keep_both';
+
+export interface RestoreResult {
+  meeting_id: string;
+  title: string;
+  folder_path: string;
+  segment_count: number;
+  restored_summary: boolean;
+  backup: MeetingBackup;
+}

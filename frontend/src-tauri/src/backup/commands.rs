@@ -1,8 +1,10 @@
+use log::warn;
 use std::path::PathBuf;
-use tauri::{AppHandle, Runtime, State};
+use tauri::{AppHandle, Emitter, Runtime, State};
 
 use super::preferences::{load_backup_preferences, save_backup_preferences, BackupPreferences};
 use super::service::BackupService;
+use super::{BackupInspection, RestoreMode, RestoreResult, RestoreService};
 use crate::database::models::MeetingBackup;
 use crate::database::repositories::backup::BackupsRepository;
 use crate::state::AppState;
@@ -155,5 +157,59 @@ pub async fn api_reset_backup_folder_to_default<R: Runtime>(
     }
 
     Ok(default_str)
+}
+
+/// Opens a file picker filtered to .zip archives; returns the selected path.
+#[tauri::command]
+pub async fn api_select_backup_zip<R: Runtime>(app: AppHandle<R>) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let picked = app
+        .dialog()
+        .file()
+        .add_filter("Meeting backup archive", &["zip"])
+        .blocking_pick_file();
+
+    Ok(picked.map(|p| p.to_string()))
+}
+
+/// Reads a backup archive without extracting it (title, contents, conflicts).
+#[tauri::command]
+pub async fn api_inspect_backup<R: Runtime>(
+    _app: AppHandle<R>,
+    state: State<'_, AppState>,
+    zip_path: String,
+) -> Result<BackupInspection, String> {
+    let pool = state.db_manager.pool();
+    RestoreService::inspect(pool, &PathBuf::from(&zip_path))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Restores a meeting from a backup archive: extracts the folder and rebuilds
+/// meetings/transcripts/summary rows. `mode` is "fresh" | "replace" | "keep_both".
+#[tauri::command]
+pub async fn api_restore_meeting<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    zip_path: String,
+    mode: String,
+) -> Result<RestoreResult, String> {
+    let pool = state.db_manager.pool();
+    let mode = RestoreMode::parse(&mode).map_err(|e| e.to_string())?;
+
+    let result = RestoreService::restore(pool, &PathBuf::from(&zip_path), mode, None)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Refresh sidebar badges and settings stats for the restored meeting.
+    if let Err(e) = app.emit("backup-updated", &result.backup) {
+        warn!(
+            "Failed to emit backup-updated after restore of {}: {}",
+            result.meeting_id, e
+        );
+    }
+
+    Ok(result)
 }
 
