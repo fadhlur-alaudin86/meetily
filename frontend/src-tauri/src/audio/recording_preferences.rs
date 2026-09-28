@@ -30,7 +30,7 @@ impl Default for RecordingPreferences {
         Self {
             save_folder: get_default_recordings_folder(),
             auto_save: true,
-            file_format: "mp4".to_string(),
+            file_format: "ogg".to_string(),
             preferred_mic_device: None,
             preferred_system_device: None,
             #[cfg(target_os = "macos")]
@@ -108,8 +108,17 @@ pub async fn load_recording_preferences<R: Runtime>(
     // Try to get the preferences from store
     let prefs = if let Some(value) = store.get("preferences") {
         match serde_json::from_value::<RecordingPreferences>(value.clone()) {
-            Ok(p) => {
+            Ok(mut p) => {
                 info!("Loaded recording preferences from store");
+                // OGG is the canonical output format; legacy stores may still
+                // carry "mp4" from before the standardization.
+                if p.file_format != "ogg" {
+                    info!(
+                        "Normalizing legacy file_format '{}' to 'ogg'",
+                        p.file_format
+                    );
+                    p.file_format = "ogg".to_string();
+                }
                 // Update macOS backend to current value if needed
                 #[cfg(target_os = "macos")]
                 {

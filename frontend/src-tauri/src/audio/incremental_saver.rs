@@ -28,9 +28,9 @@ pub struct IncrementalAudioSaver {
 }
 
 impl IncrementalAudioSaver {
-    /// Create a new incremental saver with default audio.mp4
+    /// Create a new incremental saver with default audio.ogg
     pub fn new(meeting_folder: PathBuf, sample_rate: u32) -> Result<Self> {
-        Self::with_options(meeting_folder, sample_rate, "", "audio.mp4")
+        Self::with_options(meeting_folder, sample_rate, "", "audio.ogg")
     }
 
     /// Create an incremental saver with custom subdirectory and output filename
@@ -279,12 +279,16 @@ pub async fn recover_audio_from_checkpoints(
         });
     }
 
-    // Scan for checkpoint files
+    // Scan for checkpoint files (.ogg since OGG standardization, .mp4 for
+    // recordings made before it)
     let mut checkpoint_files: Vec<_> = std::fs::read_dir(&checkpoints_dir)
         .map_err(|e| format!("Failed to read checkpoints directory: {}", e))?
         .filter_map(|entry| entry.ok())
         .filter(|entry| {
-            entry.path().extension().and_then(|s| s.to_str()) == Some("mp4")
+            matches!(
+                entry.path().extension().and_then(|s| s.to_str()),
+                Some("mp4") | Some("ogg")
+            )
         })
         .collect();
 
@@ -299,7 +303,7 @@ pub async fn recover_audio_from_checkpoints(
         });
     }
 
-    // Sort by filename (audio_chunk_000.mp4, audio_chunk_001.mp4, etc.)
+    // Sort by filename (audio_chunk_000.ogg, audio_chunk_001.ogg, etc.)
     checkpoint_files.sort_by_key(|entry| entry.path());
 
     let chunk_count = checkpoint_files.len() as u32;
@@ -320,8 +324,15 @@ pub async fn recover_audio_from_checkpoints(
     std::fs::write(&concat_file_path, concat_content)
         .map_err(|e| format!("Failed to write concat file: {}", e))?;
 
-    // Run FFmpeg to merge chunks
-    let output_path = folder_path.join("audio.mp4");
+    // Derive the output extension from the recovered checkpoints so legacy
+    // (.mp4) recordings stay .mp4 and new ones stay .ogg.
+    let first_path = checkpoint_files.first().map(|entry| entry.path());
+    let output_ext = first_path
+        .as_ref()
+        .and_then(|path| path.extension())
+        .and_then(|s| s.to_str())
+        .unwrap_or("ogg");
+    let output_path = folder_path.join(format!("audio.{}", output_ext));
     let output_path_str = output_path.to_str()
         .ok_or("Invalid output path")?
         .to_string();
@@ -411,7 +422,8 @@ pub async fn cleanup_checkpoints(meeting_folder: String) -> Result<(), String> {
 }
 
 /// Check if a meeting folder has audio checkpoint files
-/// Returns true if .checkpoints/ directory exists and contains .mp4 files
+/// Returns true if .checkpoints/ directory exists and contains .ogg or
+/// .mp4 files (mp4 = recordings made before OGG standardization)
 #[tauri::command]
 pub async fn has_audio_checkpoints(meeting_folder: String) -> Result<bool, String> {
     let folder_path = PathBuf::from(&meeting_folder);
@@ -422,15 +434,18 @@ pub async fn has_audio_checkpoints(meeting_folder: String) -> Result<bool, Strin
         return Ok(false);
     }
 
-    // Scan for .mp4 checkpoint files
-    let has_mp4_files = std::fs::read_dir(&checkpoints_dir)
+    // Scan for checkpoint audio files
+    let has_audio_files = std::fs::read_dir(&checkpoints_dir)
         .map_err(|e| format!("Failed to read checkpoints directory: {}", e))?
         .filter_map(|entry| entry.ok())
         .any(|entry| {
-            entry.path().extension().and_then(|s| s.to_str()) == Some("mp4")
+            matches!(
+                entry.path().extension().and_then(|s| s.to_str()),
+                Some("mp4") | Some("ogg")
+            )
         });
 
-    Ok(has_mp4_files)
+    Ok(has_audio_files)
 }
 
 #[cfg(test)]
@@ -470,9 +485,39 @@ mod tests {
         // Finalize and verify merge
         let final_path = saver.finalize().await.unwrap();
         assert!(final_path.exists());
+        assert_eq!(
+            final_path.file_name().unwrap(),
+            "audio.ogg",
+            "OGG is the canonical single-stream output format"
+        );
 
         // Verify checkpoints directory deleted
         assert!(!meeting_folder.join(".checkpoints").exists());
+    }
+
+    #[tokio::test]
+    async fn test_has_audio_checkpoints_accepts_ogg_and_legacy_mp4() {
+        let temp_dir = tempdir().unwrap();
+        let folder = temp_dir.path().join("Meeting");
+        std::fs::create_dir_all(folder.join(".checkpoints")).unwrap();
+        let folder_str = folder.to_string_lossy().to_string();
+
+        // Empty checkpoints directory -> false
+        assert!(!has_audio_checkpoints(folder_str.clone()).await.unwrap());
+
+        // OGG checkpoints (post-standardization) -> true
+        std::fs::write(folder.join(".checkpoints").join("audio_chunk_000.ogg"), b"fake").unwrap();
+        assert!(has_audio_checkpoints(folder_str.clone()).await.unwrap());
+
+        // Legacy mp4 checkpoints (pre-standardization) -> true
+        std::fs::remove_file(folder.join(".checkpoints").join("audio_chunk_000.ogg")).unwrap();
+        std::fs::write(folder.join(".checkpoints").join("audio_chunk_000.mp4"), b"fake").unwrap();
+        assert!(has_audio_checkpoints(folder_str.clone()).await.unwrap());
+
+        // Unrelated files -> false
+        std::fs::remove_file(folder.join(".checkpoints").join("audio_chunk_000.mp4")).unwrap();
+        std::fs::write(folder.join(".checkpoints").join("concat_list.txt"), b"x").unwrap();
+        assert!(!has_audio_checkpoints(folder_str).await.unwrap());
     }
 
     #[tokio::test]

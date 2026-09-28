@@ -644,7 +644,7 @@ pub fn write_audio_to_file_with_meeting_name(
     };
 
     let file_path = final_output_path
-        .join(format!("{}_{}.mp4", sanitized_device_name, timestamp))
+        .join(format!("{}_{}.ogg", sanitized_device_name, timestamp))
         .to_str()
         .expect("Failed to create valid path")
         .to_string();

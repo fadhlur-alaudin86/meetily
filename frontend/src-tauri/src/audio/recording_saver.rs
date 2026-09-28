@@ -391,7 +391,7 @@ impl RecordingSaver {
                 microphone: None,  // Could be enhanced to store actual device names
                 system_audio: None,
             },
-            audio_file: if create_checkpoints { "audio.mp4".to_string() } else { "".to_string() },
+            audio_file: if create_checkpoints { "audio.ogg".to_string() } else { "".to_string() },
             mic_audio_file: None,
             sys_audio_file: None,
             transcript_file: "transcripts.json".to_string(),

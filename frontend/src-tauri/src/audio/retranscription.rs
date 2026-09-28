@@ -518,7 +518,7 @@ async fn run_retranscription<R: Runtime>(
             let filename = single_audio
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or("audio.mp4")
+                .unwrap_or("audio.ogg")
                 .to_string();
 
             let (segs, dur) = process_single_audio_track(

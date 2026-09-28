@@ -1286,7 +1286,7 @@ mod tests {
             "meeting-123",
             "Test Meeting",
             1800.0,
-            "audio.mp4",
+            "audio.ogg",
             "import",
         );
         assert!(result.is_ok(), "write_import_metadata failed: {:?}", result);
@@ -1300,7 +1300,7 @@ mod tests {
         assert_eq!(parsed["meeting_id"], "meeting-123");
         assert_eq!(parsed["meeting_name"], "Test Meeting");
         assert_eq!(parsed["duration_seconds"], 1800.0);
-        assert_eq!(parsed["audio_file"], "audio.mp4");
+        assert_eq!(parsed["audio_file"], "audio.ogg");
         assert_eq!(parsed["status"], "completed");
         assert_eq!(parsed["source"], "import");
     }

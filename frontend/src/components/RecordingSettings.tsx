@@ -24,7 +24,7 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
   const [preferences, setPreferences] = useState<RecordingPreferences>({
     save_folder: '',
     auto_save: true,
-    file_format: 'mp4',
+    file_format: 'ogg',
     preferred_mic_device: null,
     preferred_system_device: null
   });
