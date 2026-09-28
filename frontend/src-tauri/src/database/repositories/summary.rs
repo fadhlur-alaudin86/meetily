@@ -77,8 +77,10 @@ impl SummaryProcessesRepository {
         pool: &SqlitePool,
         meeting_id: &str,
     ) -> Result<Option<SummaryProcess>, sqlx::Error> {
+        // LEFT JOIN: a summary must stay visible even when transcript_chunks
+        // is absent (e.g. a meeting rebuilt by restore from a backup archive).
         sqlx::query_as::<_, SummaryProcess>(
-            "SELECT p.* FROM summary_processes p JOIN transcript_chunks t ON p.meeting_id = t.meeting_id WHERE p.meeting_id = ?",
+            "SELECT p.* FROM summary_processes p LEFT JOIN transcript_chunks t ON p.meeting_id = t.meeting_id WHERE p.meeting_id = ?",
         )
         .bind(meeting_id)
         .fetch_optional(pool)
@@ -235,7 +237,23 @@ mod tests {
                 end_time TEXT,
                 chunk_count INTEGER,
                 processing_time REAL,
-                error TEXT
+                error TEXT,
+                metadata TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE transcript_chunks (
+                meeting_id TEXT PRIMARY KEY,
+                meeting_name TEXT,
+                transcript_text TEXT NOT NULL,
+                model TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                chunk_size INTEGER,
+                overlap INTEGER,
+                created_at TEXT NOT NULL
             )",
         )
         .execute(&pool)
@@ -361,5 +379,36 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(status, "PENDING");
+    }
+
+    #[tokio::test]
+    async fn test_summary_visible_without_transcript_chunks_row() {
+        let pool = test_pool().await;
+
+        // No summary at all -> idle.
+        assert!(
+            SummaryProcessesRepository::get_summary_data_for_meeting(&pool, "m1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // A completed summary with NO transcript_chunks row must still be
+        // visible: meetings rebuilt by restore have no chunks row until the
+        // summary is regenerated (LEFT JOIN, not INNER JOIN).
+        sqlx::query(
+            "INSERT INTO summary_processes (meeting_id, status, created_at, updated_at, result)
+             VALUES ('m1', 'completed', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', '{\"markdown\":\"# ok\"}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let row = SummaryProcessesRepository::get_summary_data_for_meeting(&pool, "m1")
+            .await
+            .unwrap()
+            .expect("summary must be visible without a transcript_chunks row");
+        assert_eq!(row.status, "completed");
+        assert!(row.result.is_some());
     }
 }

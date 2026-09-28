@@ -170,8 +170,10 @@ export interface BackupInspection {
   has_audio: boolean;
   has_summary: boolean;
   has_transcripts: boolean;
+  has_notes: boolean;
   segment_count: number;
   meeting_id_in_db: boolean;
+  existing_notes: boolean;
 }
 
 export type RestoreMode = 'fresh' | 'replace' | 'keep_both';
@@ -182,5 +184,6 @@ export interface RestoreResult {
   folder_path: string;
   segment_count: number;
   restored_summary: boolean;
+  restored_notes: boolean;
   backup: MeetingBackup;
 }

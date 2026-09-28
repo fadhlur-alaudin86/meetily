@@ -34,8 +34,14 @@ pub struct BackupInspection {
     pub has_audio: bool,
     pub has_summary: bool,
     pub has_transcripts: bool,
+    /// Archive carries a `db.json` entry with a meeting_notes row.
+    pub has_notes: bool,
     pub segment_count: usize,
     pub meeting_id_in_db: bool,
+    /// The conflicting meeting already has a notes row in the database
+    /// (relevant for the replace decision: it is kept when the archive
+    /// carries no notes).
+    pub existing_notes: bool,
 }
 
 /// Result of a successful restore.
@@ -46,6 +52,8 @@ pub struct RestoreResult {
     pub folder_path: String,
     pub segment_count: usize,
     pub restored_summary: bool,
+    /// A notes row from the archive was rebuilt in the database.
+    pub restored_notes: bool,
     /// Backup record pointing at the source zip, so the caller can emit
     /// `backup-updated` and refresh sidebar badges / settings stats.
     pub backup: MeetingBackup,
@@ -96,6 +104,8 @@ struct BackupContent {
     created_at: Option<DateTime<Utc>>,
     /// The `summary` payload from summary.json, if present and parseable.
     summary: Option<Value>,
+    /// The `meeting_notes` object from the synthetic db.json entry, if present.
+    meeting_notes: Option<Value>,
     segments: Vec<SegmentRow>,
     has_audio: bool,
     has_transcripts: bool,
@@ -122,6 +132,10 @@ impl RestoreService {
             Some(id) => meeting_exists(pool, id).await?,
             None => false,
         };
+        let existing_notes = match &content.meeting_id {
+            Some(id) => notes_exist(pool, id).await?,
+            None => false,
+        };
 
         let created_at = content.created_at.unwrap_or_else(Utc::now);
         let title = derive_title(content.meeting_name.as_deref(), zip_path);
@@ -134,8 +148,10 @@ impl RestoreService {
             has_audio: content.has_audio,
             has_summary: content.summary.is_some(),
             has_transcripts: content.has_transcripts,
+            has_notes: content.meeting_notes.is_some(),
             segment_count: content.segments.len(),
             meeting_id_in_db,
+            existing_notes,
         })
     }
 
@@ -260,11 +276,16 @@ impl RestoreService {
 
         // Replace: drop the old rows before inserting the rebuilt ones.
         if mode == RestoreMode::Replace {
-            sqlx::query("DELETE FROM meeting_notes WHERE meeting_id = ?")
-                .bind(&meeting_id)
-                .execute(pool)
-                .await
-                .map_err(|e| anyhow!("Failed to delete old meeting notes: {}", e))?;
+            if content.meeting_notes.is_none() {
+                // The archive has no notes (pre-db.json zip or meeting never
+                // had any): the existing DB-only notes must not be destroyed.
+                info!(
+                    "Archive has no notes; keeping existing notes for meeting {}",
+                    meeting_id
+                );
+            }
+            // The notes row itself is deleted inside insert_meeting_rows'
+            // transaction (only when the archive carries replacement notes).
             sqlx::query("DELETE FROM meeting_backups WHERE meeting_id = ?")
                 .bind(&meeting_id)
                 .execute(pool)
@@ -279,8 +300,16 @@ impl RestoreService {
         }
 
         let folder_path = target_folder.to_string_lossy().to_string();
-        let insert_result =
-            insert_meeting_rows(pool, &meeting_id, &title, created_at, &folder_path, &content).await;
+        let insert_result = insert_meeting_rows(
+            pool,
+            &meeting_id,
+            &title,
+            created_at,
+            &folder_path,
+            &content,
+            mode == RestoreMode::Replace,
+        )
+        .await;
 
         if let Err(e) = insert_result {
             if mode != RestoreMode::Replace {
@@ -300,6 +329,7 @@ impl RestoreService {
 
         let segment_count = content.segments.len();
         let restored_summary = content.summary.is_some();
+        let restored_notes = content.meeting_notes.is_some();
 
         let backup_record = MeetingBackup {
             meeting_id: meeting_id.clone(),
@@ -317,8 +347,8 @@ impl RestoreService {
         }
 
         info!(
-            "Restored meeting '{}' ({}) from {:?} with {} transcript segments, summary={}",
-            title, meeting_id, zip_path, segment_count, restored_summary
+            "Restored meeting '{}' ({}) from {:?} with {} transcript segments, summary={}, notes={}",
+            title, meeting_id, zip_path, segment_count, restored_summary, restored_notes
         );
 
         Ok(RestoreResult {
@@ -327,6 +357,7 @@ impl RestoreService {
             folder_path,
             segment_count,
             restored_summary,
+            restored_notes,
             backup: backup_record,
         })
     }
@@ -409,6 +440,16 @@ fn read_backup_content(zip_path: &Path) -> Result<BackupContent> {
         if let Ok(v) = serde_json::from_slice::<Value>(&raw) {
             if let Some(summary) = v.get("summary").filter(|s| !s.is_null()) {
                 content.summary = Some(summary.clone());
+            }
+        }
+    }
+
+    // db.json: synthetic entry with DB-only data (meeting_notes).
+    let db_name = format!("{}db.json", content.prefix);
+    if let Some(raw) = read_entry(&mut archive, &db_name) {
+        if let Ok(v) = serde_json::from_slice::<Value>(&raw) {
+            if let Some(notes) = v.get("meeting_notes").filter(|n| n.is_object()) {
+                content.meeting_notes = Some(notes.clone());
             }
         }
     }
@@ -632,7 +673,20 @@ async fn meeting_exists(pool: &SqlitePool, meeting_id: &str) -> Result<bool> {
     Ok(row.is_some())
 }
 
+async fn notes_exist(pool: &SqlitePool, meeting_id: &str) -> Result<bool> {
+    let row: Option<(i64,)> =
+        sqlx::query_as("SELECT 1 FROM meeting_notes WHERE meeting_id = ?")
+            .bind(meeting_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.is_some())
+}
+
 /// Insert meetings/transcripts/summary_processes rows in one transaction.
+///
+/// `replace_existing_notes` (replace mode): when the archive carries notes,
+/// the old row is deleted in the same transaction before inserting; when it
+/// does not, any existing notes row is left untouched.
 async fn insert_meeting_rows(
     pool: &SqlitePool,
     meeting_id: &str,
@@ -640,6 +694,7 @@ async fn insert_meeting_rows(
     created_at: DateTime<Utc>,
     folder_path: &str,
     content: &BackupContent,
+    replace_existing_notes: bool,
 ) -> std::result::Result<(), sqlx::Error> {
     let mut conn = pool.acquire().await?;
     let mut tx = sqlx::Connection::begin(&mut *conn).await?;
@@ -688,6 +743,47 @@ async fn insert_meeting_rows(
         .bind(now)
         .bind(now)
         .bind(result_str)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    if let Some(notes) = &content.meeting_notes {
+        if replace_existing_notes {
+            sqlx::query("DELETE FROM meeting_notes WHERE meeting_id = ?")
+                .bind(meeting_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let empty = String::new();
+        let created = notes
+            .get("created_at")
+            .and_then(Value::as_str)
+            .unwrap_or(&empty);
+        let updated = notes
+            .get("updated_at")
+            .and_then(Value::as_str)
+            .unwrap_or(&empty);
+        sqlx::query(
+            "INSERT INTO meeting_notes (meeting_id, notes_markdown, notes_json, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(meeting_id) DO UPDATE SET
+                notes_markdown = excluded.notes_markdown,
+                notes_json = excluded.notes_json,
+                updated_at = excluded.updated_at",
+        )
+        .bind(meeting_id)
+        .bind(notes.get("notes_markdown").and_then(Value::as_str))
+        .bind(notes.get("notes_json").and_then(Value::as_str))
+        .bind(if created.is_empty() {
+            created_at.to_rfc3339()
+        } else {
+            created.to_string()
+        })
+        .bind(if updated.is_empty() {
+            created_at.to_rfc3339()
+        } else {
+            updated.to_string()
+        })
         .execute(&mut *tx)
         .await?;
     }
@@ -1039,7 +1135,7 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO meeting_notes (meeting_id, created_at, updated_at) VALUES ('meeting-abc', '2026-01-01', '2026-01-01')",
+            "INSERT INTO meeting_notes (meeting_id, notes_markdown, created_at, updated_at) VALUES ('meeting-abc', 'old notes stay', '2026-01-01', '2026-01-01')",
         )
         .execute(&pool)
         .await
@@ -1080,7 +1176,9 @@ mod tests {
         assert!(old_folder.join("metadata.json").exists());
         assert!(old_folder.join("mic.ogg").exists());
 
-        // DB rows replaced; old notes gone.
+        // DB rows replaced. The archive carries no db.json, so the existing
+        // DB-only notes row is preserved (never destroyed by a notes-less
+        // archive); stale transcript rows are gone.
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM transcripts WHERE meeting_id = 'meeting-abc'")
             .fetch_one(&pool)
             .await
@@ -1090,7 +1188,13 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(notes.0, 0, "stale notes removed with replaced content");
+        assert_eq!(notes.0, 1, "existing notes kept when archive has none");
+        let notes_text: String =
+            sqlx::query_scalar("SELECT notes_markdown FROM meeting_notes WHERE meeting_id = 'meeting-abc'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(notes_text, "old notes stay");
         let meetings: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM meetings WHERE id = 'meeting-abc'")
             .fetch_one(&pool)
             .await
@@ -1171,6 +1275,173 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("already exists"));
+    }
+
+    const DB_JSON: &str = r##"{
+        "version": "1.0",
+        "meeting_notes": {
+            "notes_markdown": "# restored notes",
+            "notes_json": "{\"blocks\":[]}",
+            "created_at": "2026-09-20T09:00:00+00:00",
+            "updated_at": "2026-09-21T10:00:00+00:00"
+        }
+    }"##;
+
+    fn notes_backup_zip(dir: &Path) -> PathBuf {
+        let zip_path = dir.join("2026-09-20_Team-Standup_notes.zip");
+        write_zip(
+            &zip_path,
+            &[
+                ("metadata.json", METADATA),
+                ("transcripts.json", TRANSCRIPTS),
+                ("summary.json", SUMMARY),
+                ("mic.ogg", "fake-ogg-bytes"),
+                ("db.json", DB_JSON),
+            ],
+        );
+        zip_path
+    }
+
+    #[tokio::test]
+    async fn test_inspect_reports_notes_presence() {
+        let pool = test_pool().await;
+        let dir = TempDir::new().unwrap();
+
+        // Archive without db.json.
+        let plain = full_backup_zip(dir.path());
+        let info = RestoreService::inspect(&pool, &plain).await.unwrap();
+        assert!(!info.has_notes, "old archive carries no db.json");
+        assert!(!info.existing_notes, "meeting has no notes row yet");
+
+        // Archive with db.json + existing conflicting notes in the DB.
+        let with_notes = notes_backup_zip(dir.path());
+        let info = RestoreService::inspect(&pool, &with_notes).await.unwrap();
+        assert!(info.has_notes, "db.json entry detected");
+        assert!(!info.existing_notes, "still no rows in the db");
+
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at) VALUES ('meeting-abc', 'Old', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO meeting_notes (meeting_id, notes_markdown, created_at, updated_at) VALUES ('meeting-abc', 'existing', '2026-01-01', '2026-01-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let info = RestoreService::inspect(&pool, &with_notes).await.unwrap();
+        assert!(info.meeting_id_in_db);
+        assert!(info.existing_notes, "conflicting meeting has a notes row");
+    }
+
+    #[tokio::test]
+    async fn test_restore_fresh_inserts_notes_from_db_json() {
+        let pool = test_pool().await;
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("recordings");
+        let zip_path = notes_backup_zip(dir.path());
+
+        let result = RestoreService::restore(&pool, &zip_path, RestoreMode::Fresh, Some(&base))
+            .await
+            .unwrap();
+
+        assert!(result.restored_notes, "notes come back with the meeting");
+        let (markdown, updated): (String, String) = sqlx::query_as(
+            "SELECT notes_markdown, updated_at FROM meeting_notes WHERE meeting_id = 'meeting-abc'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(markdown, "# restored notes");
+        assert_eq!(updated, "2026-09-21T10:00:00+00:00");
+    }
+
+    #[tokio::test]
+    async fn test_restore_replace_replaces_notes_when_archive_has_them() {
+        let pool = test_pool().await;
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("recordings");
+        let zip_path = notes_backup_zip(dir.path());
+
+        // Existing meeting with old notes.
+        let old_folder = base.join("Old-Standup_2026-01-01_10-00");
+        std::fs::create_dir_all(&old_folder).unwrap();
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at, folder_path)
+             VALUES ('meeting-abc', 'Old Standup', '2026-01-01T10:00:00+00:00', '2026-01-01T10:00:00+00:00', ?)",
+        )
+        .bind(old_folder.to_string_lossy().to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO meeting_notes (meeting_id, notes_markdown, created_at, updated_at) VALUES ('meeting-abc', 'old notes', '2026-01-01', '2026-01-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = RestoreService::restore(&pool, &zip_path, RestoreMode::Replace, Some(&base))
+            .await
+            .unwrap();
+
+        assert!(result.restored_notes);
+        let markdown: String =
+            sqlx::query_scalar("SELECT notes_markdown FROM meeting_notes WHERE meeting_id = 'meeting-abc'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(markdown, "# restored notes", "old notes replaced in-tx");
+        let rows: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM meeting_notes WHERE meeting_id = 'meeting-abc'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.0, 1, "no duplicate notes rows after replace");
+    }
+
+    #[tokio::test]
+    async fn test_restore_keep_both_attaches_notes_to_new_identity() {
+        let pool = test_pool().await;
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("recordings");
+        let zip_path = notes_backup_zip(dir.path());
+
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at) VALUES ('meeting-abc', 'Team Standup', '2026-09-20T08:30:00+00:00', '2026-09-20T08:30:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO meeting_notes (meeting_id, notes_markdown, created_at, updated_at) VALUES ('meeting-abc', 'original notes', '2026-01-01', '2026-01-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = RestoreService::restore(&pool, &zip_path, RestoreMode::KeepBoth, Some(&base))
+            .await
+            .unwrap();
+
+        assert!(result.restored_notes);
+        assert_ne!(result.meeting_id, "meeting-abc");
+        // Copy carries the archive notes; the original keeps its own.
+        let copy_notes: String =
+            sqlx::query_scalar("SELECT notes_markdown FROM meeting_notes WHERE meeting_id = ?")
+                .bind(&result.meeting_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(copy_notes, "# restored notes");
+        let original_notes: String =
+            sqlx::query_scalar("SELECT notes_markdown FROM meeting_notes WHERE meeting_id = 'meeting-abc'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(original_notes, "original notes");
     }
 
     #[test]

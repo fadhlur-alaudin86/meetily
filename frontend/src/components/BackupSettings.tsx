@@ -124,8 +124,8 @@ export function BackupSettings() {
         });
         toast.success('Meeting restored', {
           description: `${result.title} — ${result.segment_count} transcript segment(s)${
-            result.restored_summary ? ', summary included' : ''
-          }`,
+            result.restored_summary ? ', summary' : ''
+          }${result.restored_notes ? ', notes' : ''}`,
         });
         setRestoreInfo(null);
         // Sidebar meeting list refresh; badges/stats follow the
@@ -333,6 +333,7 @@ export function BackupSettings() {
                   {restoreInfo.segment_count} transcript segment(s)
                   {restoreInfo.has_summary ? ', summary' : ''}
                   {restoreInfo.has_audio ? ', audio' : ''}
+                  {restoreInfo.has_notes ? ', notes' : ''}
                 </div>
               </div>
               <div className="space-y-2 text-xs text-gray-600">
@@ -347,6 +348,11 @@ export function BackupSettings() {
                   meeting with the title suffix <em>(restored)</em>; the existing meeting stays
                   untouched.
                 </p>
+                {!restoreInfo.has_notes && restoreInfo.existing_notes && (
+                  <p className="text-amber-700">
+                    This archive carries no notes; the meeting's existing notes will be kept.
+                  </p>
+                )}
               </div>
             </div>
           )}

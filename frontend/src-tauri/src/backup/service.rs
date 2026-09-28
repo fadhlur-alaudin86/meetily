@@ -49,6 +49,9 @@ impl BackupService {
         };
         ensure_backup_directory(&backup_dir)?;
 
+        // DB-only data (meeting_notes) packed as a synthetic `db.json` entry.
+        let db_payload = Self::read_notes_payload(pool, meeting_id).await?;
+
         // Format zip filename: {date}_{sanitized_title}_backup.zip
         let date_prefix = meeting
             .created_at
@@ -65,7 +68,11 @@ impl BackupService {
             meeting.title, target_zip_path
         );
 
-        let (has_audio, has_summary) = Self::pack_meeting_zip(&meeting_folder, &target_zip_path)?;
+        let (has_audio, has_summary) = Self::pack_meeting_zip(
+            &meeting_folder,
+            &target_zip_path,
+            db_payload.as_ref(),
+        )?;
 
         let status = if has_summary {
             "ok".to_string()
@@ -131,12 +138,45 @@ impl BackupService {
         Ok(results)
     }
 
+    /// Reads the meeting's `meeting_notes` row (if any) into the payload
+    /// that gets packed as the synthetic `db.json` zip entry. The presence
+    /// of the entry in an archive is what `has_notes` is keyed on.
+    pub async fn read_notes_payload(
+        pool: &SqlitePool,
+        meeting_id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let row: Option<(Option<String>, Option<String>, String, String)> = sqlx::query_as(
+            "SELECT notes_markdown, notes_json, created_at, updated_at FROM meeting_notes WHERE meeting_id = ?",
+        )
+        .bind(meeting_id)
+        .fetch_optional(pool)
+        .await?;
+
+        Ok(row.map(|(markdown, json, created_at, updated_at)| {
+            serde_json::json!({
+                "version": "1.0",
+                "meeting_notes": {
+                    "notes_markdown": markdown,
+                    "notes_json": json,
+                    "created_at": created_at,
+                    "updated_at": updated_at,
+                }
+            })
+        }))
+    }
+
     /// Packs all files in `meeting_folder` into a zip archive at `target_zip_path`.
     ///
     /// - Skips `.checkpoints/` sub-directory and any hidden or `.tmp` files.
     /// - Returns `(has_audio, has_summary)` derived from the files packed.
     /// - Writes atomically: fills a `.tmp` file first, then renames on success.
-    fn pack_meeting_zip(meeting_folder: &std::path::Path, target_zip_path: &std::path::Path) -> Result<(bool, bool)> {
+    /// - When `db_payload` is present it is written as a synthetic root-level
+    ///   `db.json` entry (DB-only data such as meeting_notes).
+    fn pack_meeting_zip(
+        meeting_folder: &std::path::Path,
+        target_zip_path: &std::path::Path,
+        db_payload: Option<&serde_json::Value>,
+    ) -> Result<(bool, bool)> {
         let parent = target_zip_path
             .parent()
             .ok_or_else(|| anyhow!("Target zip path has no parent directory"))?;
@@ -164,6 +204,23 @@ impl BackupService {
                 let _ = std::fs::remove_file(&tmp_path);
                 e
             })?;
+
+        // Synthetic entry for DB-only data (not present in the folder).
+        if let Some(payload) = db_payload {
+            let json = serde_json::to_string_pretty(payload)
+                .map_err(|e| anyhow!("Failed to serialize db.json payload: {}", e))?;
+            let write_result = zip
+                .start_file("db.json", options)
+                .map_err(|e| anyhow!("Failed to start db.json zip entry: {}", e))
+                .and_then(|_| {
+                    zip.write_all(json.as_bytes())
+                        .map_err(|e| anyhow!("Failed to write db.json zip entry: {}", e))
+                });
+            if let Err(e) = write_result {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(e);
+            }
+        }
 
         zip.finish()
             .map_err(|e| {
@@ -323,7 +380,7 @@ mod tests {
 
         let zip_path = out_dir.path().join("test_backup.zip");
         let (has_audio, has_summary) =
-            BackupService::pack_meeting_zip(meeting_dir.path(), &zip_path).unwrap();
+            BackupService::pack_meeting_zip(meeting_dir.path(), &zip_path, None).unwrap();
 
         assert!(zip_path.exists(), "zip file should be created");
         assert!(!has_audio);
@@ -349,7 +406,7 @@ mod tests {
 
         let zip_path = out_dir.path().join("test_backup.zip");
         let (has_audio, has_summary) =
-            BackupService::pack_meeting_zip(meeting_dir.path(), &zip_path).unwrap();
+            BackupService::pack_meeting_zip(meeting_dir.path(), &zip_path, None).unwrap();
 
         assert!(has_audio, "should detect .ogg audio files");
         assert!(has_summary, "should detect summary.json");
@@ -369,7 +426,7 @@ mod tests {
         create_file(&meeting_dir.path().join("temp.tmp"), b"temp");
 
         let zip_path = out_dir.path().join("test_backup.zip");
-        BackupService::pack_meeting_zip(meeting_dir.path(), &zip_path).unwrap();
+        BackupService::pack_meeting_zip(meeting_dir.path(), &zip_path, None).unwrap();
 
         let mut archive = ZipArchive::new(File::open(&zip_path).unwrap()).unwrap();
         let names: Vec<String> = (0..archive.len())
@@ -394,7 +451,7 @@ mod tests {
         create_file(&meeting_dir.path().join("transcripts.json"), expected);
 
         let zip_path = out_dir.path().join("test_backup.zip");
-        BackupService::pack_meeting_zip(meeting_dir.path(), &zip_path).unwrap();
+        BackupService::pack_meeting_zip(meeting_dir.path(), &zip_path, None).unwrap();
 
         let mut archive = ZipArchive::new(File::open(&zip_path).unwrap()).unwrap();
         let mut entry = archive.by_name("transcripts.json").unwrap();
@@ -440,5 +497,93 @@ mod tests {
 
         assert!(present.is_empty());
         assert_eq!(missing.len(), 1);
+    }
+
+    #[test]
+    fn test_pack_writes_db_json_only_when_payload_present() {
+        let meeting_dir = TempDir::new().unwrap();
+        let out_dir = TempDir::new().unwrap();
+        create_file(&meeting_dir.path().join("metadata.json"), b"{}");
+
+        let payload = serde_json::json!({
+            "version": "1.0",
+            "meeting_notes": {
+                "notes_markdown": "# my notes",
+                "notes_json": null,
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "updated_at": "2026-01-01T00:00:00+00:00",
+            }
+        });
+
+        let with_notes = out_dir.path().join("with_notes.zip");
+        BackupService::pack_meeting_zip(
+            meeting_dir.path(),
+            &with_notes,
+            Some(&payload),
+        )
+        .unwrap();
+        let mut archive = ZipArchive::new(File::open(&with_notes).unwrap()).unwrap();
+        let mut entry = archive.by_name("db.json").expect("db.json entry present");
+        let mut content = String::new();
+        entry.read_to_string(&mut content).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["version"], "1.0");
+        assert_eq!(parsed["meeting_notes"]["notes_markdown"], "# my notes");
+        assert!(parsed["meeting_notes"]["notes_json"].is_null());
+
+        let without_notes = out_dir.path().join("without_notes.zip");
+        BackupService::pack_meeting_zip(meeting_dir.path(), &without_notes, None).unwrap();
+        let mut archive = ZipArchive::new(File::open(&without_notes).unwrap()).unwrap();
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(
+            !names.contains(&"db.json".to_string()),
+            "no db.json when the meeting has no notes row"
+        );
+    }
+
+    async fn notes_pool() -> sqlx::SqlitePool {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE meeting_notes (meeting_id TEXT PRIMARY KEY, notes_markdown TEXT, notes_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn test_read_notes_payload_roundtrip() {
+        let pool = notes_pool().await;
+
+        assert!(
+            BackupService::read_notes_payload(&pool, "nope")
+                .await
+                .unwrap()
+                .is_none(),
+            "no row -> no payload"
+        );
+
+        sqlx::query(
+            "INSERT INTO meeting_notes (meeting_id, notes_markdown, notes_json, created_at, updated_at)
+             VALUES ('m1', 'hello notes', NULL, '2026-01-01T00:00:00+00:00', '2026-01-02T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let payload = BackupService::read_notes_payload(&pool, "m1")
+            .await
+            .unwrap()
+            .expect("payload for existing row");
+        assert_eq!(payload["version"], "1.0");
+        assert_eq!(payload["meeting_notes"]["notes_markdown"], "hello notes");
+        assert!(payload["meeting_notes"]["notes_json"].is_null());
+        assert_eq!(
+            payload["meeting_notes"]["updated_at"],
+            "2026-01-02T00:00:00+00:00"
+        );
     }
 }
