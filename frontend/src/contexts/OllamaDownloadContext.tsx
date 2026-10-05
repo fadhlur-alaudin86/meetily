@@ -1,6 +1,6 @@
 'use client';
 
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
 
@@ -37,6 +37,13 @@ export function OllamaDownloadProvider({ children }: { children: React.ReactNode
   const [downloadProgress, setDownloadProgress] = useState<Map<string, number>>(new Map());
   const [downloadingModels, setDownloadingModels] = useState<Set<string>>(new Set());
 
+  // Throttle high-frequency backend progress events (same pattern as
+  // WhisperModelManager): at most one state update per 300ms, on a >=5%
+  // jump, or at completion. Without this, every event mints new Map/Set
+  // identities and re-renders every consumer (e.g. the whole
+  // Settings > Summary tree) dozens of times per second during downloads.
+  const progressThrottleRef = useRef<Map<string, { progress: number; timestamp: number }>>(new Map());
+
   /**
    * Set up event listeners for download progress
    * These persist for the lifetime of the app, unlike modal-scoped listeners
@@ -52,6 +59,16 @@ export function OllamaDownloadProvider({ children }: { children: React.ReactNode
           'ollama-model-download-progress',
           (event) => {
             const { modelName, progress } = event.payload;
+            const now = Date.now();
+            const last = progressThrottleRef.current.get(modelName);
+            const shouldUpdate =
+              !last ||
+              progress >= 100 ||
+              now - last.timestamp > 300 ||
+              Math.abs(progress - last.progress) >= 5;
+            if (!shouldUpdate) return;
+
+            progressThrottleRef.current.set(modelName, { progress, timestamp: now });
             console.log(`🔵 [OllamaDownloadContext] Progress for ${modelName}: ${progress}%`);
 
             setDownloadProgress(prev => {
@@ -84,6 +101,7 @@ export function OllamaDownloadProvider({ children }: { children: React.ReactNode
             });
 
             // Clear progress and remove from downloading set
+            progressThrottleRef.current.delete(modelName);
             setDownloadProgress(prev => {
               const newProgress = new Map(prev);
               newProgress.delete(modelName);
@@ -112,6 +130,7 @@ export function OllamaDownloadProvider({ children }: { children: React.ReactNode
             });
 
             // Clear progress and remove from downloading set
+            progressThrottleRef.current.delete(modelName);
             setDownloadProgress(prev => {
               const newProgress = new Map(prev);
               newProgress.delete(modelName);

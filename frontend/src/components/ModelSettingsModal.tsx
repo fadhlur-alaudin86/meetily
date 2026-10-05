@@ -15,7 +15,6 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { Alert, AlertDescription } from '@/components/ui/alert';
-import { ScrollArea } from '@/components/ui/scroll-area';
 import { Switch } from '@/components/ui/switch';
 import { Lock, Unlock, Eye, EyeOff, RefreshCw, CheckCircle2, XCircle, ChevronDown, ChevronUp, Download, ExternalLink, Check, ChevronsUpDown } from 'lucide-react';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
@@ -1298,7 +1297,10 @@ export function ModelSettingsModal({
                 )}
               </div>
             ) : !ollamaEndpointChanged && (
-              <ScrollArea className="max-h-[calc(100vh-450px)] overflow-y-auto pr-4">
+              // No inner scroll container here on purpose: the list flows with
+              // the page scroller. A nested ScrollArea traps wheel events and
+              // makes Settings > Summary scrolling feel janky.
+              <div>
                 {filteredModels.length === 0 ? (
                   <Alert>
                     <AlertDescription>
@@ -1353,7 +1355,7 @@ export function ModelSettingsModal({
                     })}
                   </div>
                 )}
-              </ScrollArea>
+              </div>
             )}
           </div>
         )}
