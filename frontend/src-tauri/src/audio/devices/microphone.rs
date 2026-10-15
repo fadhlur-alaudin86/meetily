@@ -6,6 +6,26 @@ use super::configuration::{AudioDevice, DeviceType};
 
 /// Get the default input (microphone) device for the system
 pub fn default_input_device() -> Result<AudioDevice> {
+    #[cfg(target_os = "linux")]
+    {
+        // Prefer the PipeWire route: the ALSA "pipewire" PCM follows the
+        // live PipeWire default source, while raw ALSA "default" capture can
+        // land on a suspended/stale node and record silence.
+        if super::platform::default_source_name().is_some() {
+            let host = cpal::default_host();
+            if let Ok(inputs) = host.input_devices() {
+                for device in inputs {
+                    if let Ok(name) = device.name() {
+                        if name == "pipewire" {
+                            info!("🎤 Using PipeWire route for default microphone: 'pipewire'");
+                            return Ok(AudioDevice::new(name, DeviceType::Input));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let host = cpal::default_host();
     let device = host
         .default_input_device()

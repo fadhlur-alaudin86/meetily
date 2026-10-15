@@ -48,6 +48,7 @@ pub mod anthropic;
 pub mod groq;
 pub mod openrouter;
 pub mod parakeet_engine;
+pub mod quit;
 pub mod state;
 pub mod summary;
 pub mod tray;
@@ -58,7 +59,7 @@ use audio::{list_audio_devices, AudioDevice, trigger_audio_permission};
 use log::{error as log_error, info as log_info};
 use notifications::commands::NotificationManagerState;
 use std::sync::Arc;
-use tauri::{AppHandle, Manager, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::sync::RwLock;
 
 static RECORDING_FLAG: AtomicBool = AtomicBool::new(false);
@@ -600,10 +601,27 @@ pub fn run() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
                     api.prevent_close();
-                    if let Err(e) = window.hide() {
-                        log::error!("Failed to hide main window on close request: {}", e);
-                    } else {
-                        log::info!("Main window hidden to tray on close request");
+                    // Route the close request through the stored quit
+                    // preference: hide now, exit now, or ask the frontend
+                    // to show the confirmation dialog.
+                    match quit::get_quit_behavior(&window.app_handle()).as_str() {
+                        "background" => {
+                            if let Err(e) = window.hide() {
+                                log::error!("Failed to hide main window on close request: {}", e);
+                            } else {
+                                log::info!("Main window hidden to tray on close request");
+                            }
+                        }
+                        "kill" => {
+                            log::info!("Quitting app on close request (stored preference)");
+                            window.app_handle().exit(0);
+                        }
+                        _ => {
+                            log::info!("Asking frontend to show quit dialog");
+                            if let Err(e) = window.emit("show-quit-dialog", ()) {
+                                log::error!("Failed to emit show-quit-dialog: {}", e);
+                            }
+                        }
                     }
                 }
             }
@@ -680,6 +698,10 @@ pub fn run() {
             whisper_engine::parallel_commands::prepare_audio_chunks,
             whisper_engine::parallel_commands::test_parallel_processing_setup,
             get_audio_devices,
+            quit::api_get_quit_behavior,
+            quit::api_set_quit_behavior,
+            quit::api_quit_background,
+            quit::api_quit_app,
             trigger_microphone_permission,
             start_recording_with_devices,
             start_recording_with_devices_and_meeting,

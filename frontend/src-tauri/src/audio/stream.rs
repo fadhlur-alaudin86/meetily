@@ -22,6 +22,14 @@ pub enum StreamBackend {
     CoreAudio {
         task: Option<tokio::task::JoinHandle<()>>,
     },
+    /// Linux PulseAudio/PipeWire monitor capture via a helper subprocess
+    /// (pw-cat/pw-record/ffmpeg) piping raw PCM into the pipeline
+    /// (cpal has no PulseAudio backend).
+    #[cfg(target_os = "linux")]
+    MonitorPipe {
+        task: Option<tokio::task::JoinHandle<()>>,
+        child: Option<tokio::process::Child>,
+    },
 }
 
 // SAFETY: While Stream doesn't implement Send, we ensure it's only accessed
@@ -111,6 +119,21 @@ impl AudioStream {
     ) -> Result<Self> {
         info!("Creating CPAL stream for device: {}", device.name);
 
+        // Linux PulseAudio/PipeWire monitors cannot be opened through cpal
+        // (no PulseAudio backend), so tagged monitor devices are captured
+        // via a helper subprocess instead.
+        #[cfg(target_os = "linux")]
+        if let Some(monitor) = super::devices::platform::pulse_monitor_name(&device.name) {
+            return Self::create_monitor_pipe_stream(
+                device,
+                state,
+                device_type,
+                recording_sender,
+                &monitor,
+            )
+            .await;
+        }
+
         // Get the underlying cpal device and config
         let (cpal_device, config) = get_device_and_config(&device).await?;
 
@@ -137,6 +160,241 @@ impl AudioStream {
         Ok(Self {
             device,
             backend: StreamBackend::Cpal(stream),
+        })
+    }
+
+    /// Probe whether an ffmpeg binary can open a PulseAudio monitor.
+    /// Opens the monitor briefly and discards the output; success means the
+    /// binary has PulseAudio input support and can reach the sound server.
+    #[cfg(target_os = "linux")]
+    async fn ffmpeg_supports_pulse(ffmpeg: &std::path::Path, monitor: &str) -> bool {
+        let status = tokio::process::Command::new(ffmpeg)
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-f")
+            .arg("pulse")
+            .arg("-i")
+            .arg(monitor)
+            .arg("-t")
+            .arg("0.2")
+            .arg("-f")
+            .arg("null")
+            .arg("-")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+        matches!(status, Ok(s) if s.success())
+    }
+
+    /// Create a PulseAudio/PipeWire monitor capture stream (Linux only).
+    ///
+    /// Captures the monitor as 48kHz stereo float32 and feeds the raw PCM
+    /// into the normal pipeline (which downmixes to mono itself). Prefers
+    /// PipeWire-native `pw-cat`/`pw-record` (always present where monitors
+    /// exist), falling back to ffmpeg only if it probes OK for PulseAudio
+    /// input (the bundled static build lacks it). Mirrors the chunking in
+    /// `SystemAudioStreamManager::create`.
+    #[cfg(target_os = "linux")]
+    async fn create_monitor_pipe_stream(
+        device: Arc<AudioDevice>,
+        state: Arc<RecordingState>,
+        device_type: DeviceType,
+        recording_sender: Option<mpsc::UnboundedSender<super::recording_state::AudioChunk>>,
+        monitor: &str,
+    ) -> Result<Self> {
+        use tokio::io::AsyncReadExt;
+
+        info!("Creating monitor pipe capture for: {}", monitor);
+
+        // pw-* --target needs the numeric source id; a monitor name
+        // silently misses and captures zeros. Ids shift on reconnect, so
+        // resolve fresh per recording; fall back to the name on failure.
+        let target =
+            super::devices::platform::pulse_monitor_target_id(monitor).unwrap_or_else(|| {
+                warn!(
+                    "Could not resolve target id for monitor '{}', falling back to name",
+                    monitor
+                );
+                monitor.to_string()
+            });
+
+        // (binary, args). pw-* default to an AU container on stdout, so we
+        // pass --container=raw for header-less f32le; ffmpeg is raw anyway.
+        let mut sources: Vec<(std::path::PathBuf, Vec<String>)> = vec![
+            (
+                std::path::PathBuf::from("pw-cat"),
+                vec![
+                    format!("--target={}", target),
+                    "-r".to_string(),
+                    "--format=f32".to_string(),
+                    "--rate=48000".to_string(),
+                    "--channels=2".to_string(),
+                    "--container=raw".to_string(),
+                    "-".to_string(),
+                ],
+            ),
+            (
+                std::path::PathBuf::from("pw-record"),
+                vec![
+                    format!("--target={}", target),
+                    "--format=f32".to_string(),
+                    "--rate=48000".to_string(),
+                    "--channels=2".to_string(),
+                    "--container=raw".to_string(),
+                    "-".to_string(),
+                ],
+            ),
+        ];
+        if let Some(ffmpeg) = super::ffmpeg::find_ffmpeg_path() {
+            sources.push((
+                ffmpeg,
+                vec![
+                    "-hide_banner".to_string(),
+                    "-loglevel".to_string(),
+                    "error".to_string(),
+                    "-f".to_string(),
+                    "pulse".to_string(),
+                    "-i".to_string(),
+                    monitor.to_string(),
+                    "-f".to_string(),
+                    "f32le".to_string(),
+                    "-ac".to_string(),
+                    "2".to_string(),
+                    "-ar".to_string(),
+                    "48000".to_string(),
+                    "-".to_string(),
+                ],
+            ));
+        }
+        // Last resort: ffmpeg resolved via PATH.
+        sources.push((
+            std::path::PathBuf::from("ffmpeg"),
+            vec![
+                "-hide_banner".to_string(),
+                "-loglevel".to_string(),
+                "error".to_string(),
+                "-f".to_string(),
+                "pulse".to_string(),
+                "-i".to_string(),
+                monitor.to_string(),
+                "-f".to_string(),
+                "f32le".to_string(),
+                "-ac".to_string(),
+                "2".to_string(),
+                "-ar".to_string(),
+                "48000".to_string(),
+                "-".to_string(),
+            ],
+        ));
+
+        let mut child_opt: Option<tokio::process::Child> = None;
+        for (bin, args) in &sources {
+            // ffmpeg without PulseAudio input support fails instantly; probe it.
+            // (The bundled static build lacks it.)
+            if bin.to_string_lossy().contains("ffmpeg")
+                && !Self::ffmpeg_supports_pulse(bin, monitor).await
+            {
+                warn!("{:?} cannot open Pulse monitor '{}', trying next", bin, monitor);
+                continue;
+            }
+            match tokio::process::Command::new(bin)
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(child) => {
+                    info!("Monitor capture for '{}' via {:?}", monitor, bin);
+                    child_opt = Some(child);
+                    break;
+                }
+                Err(e) => {
+                    warn!("Failed to spawn {:?} for monitor capture: {}", bin, e);
+                }
+            }
+        }
+        let mut child = child_opt.ok_or_else(|| {
+            anyhow::anyhow!(
+                "No working monitor capture backend (pw-cat/pw-record/ffmpeg) for '{}'",
+                monitor
+            )
+        })?;
+
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("monitor capture stdout unavailable"))?;
+
+        // 48kHz stereo float32 little-endian, matching the ffmpeg arguments.
+        let capture = AudioCapture::new(
+            device.clone(),
+            state.clone(),
+            48000,
+            2,
+            device_type,
+            recording_sender,
+        );
+
+        let device_name = device.name.clone();
+        let task = tokio::spawn({
+            let capture = capture.clone();
+            async move {
+                // Raw f32le stereo @48kHz, no container (pw-* run with
+                // --container=raw, ffmpeg with -f f32le).
+                let mut byte_buf = vec![0u8; 4096 * 4];
+                let mut samples: Vec<f32> = Vec::with_capacity(4096);
+                let mut total_bytes: u64 = 0;
+
+                loop {
+                    match stdout.read_exact(&mut byte_buf).await {
+                        Ok(_) => {
+                            total_bytes += byte_buf.len() as u64;
+                            samples.extend(byte_buf.chunks_exact(4).map(|c| {
+                                f32::from_le_bytes([c[0], c[1], c[2], c[3]])
+                            }));
+                            if samples.len() >= 4096 {
+                                capture.process_audio_data(&samples);
+                                samples.clear();
+                            }
+                        }
+                        Err(e) => {
+                            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                                info!("Monitor pipe closed for {}", device_name);
+                            } else {
+                                warn!("Monitor pipe read error for {}: {}", device_name, e);
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                // Process any remaining samples
+                if !samples.is_empty() {
+                    capture.process_audio_data(&samples);
+                }
+
+                if total_bytes == 0 {
+                    warn!(
+                        "Monitor pipe for {} captured 0 bytes — monitor may be silent or the capture backend lost the PipeWire connection",
+                        device_name
+                    );
+                }
+                info!("Monitor pipe task ended for {}", device_name);
+            }
+        });
+
+        info!("Monitor pipe capture started for device: {}", device.name);
+
+        Ok(Self {
+            device,
+            backend: StreamBackend::MonitorPipe {
+                task: Some(task),
+                child: Some(child),
+            },
         })
     }
 
@@ -341,6 +599,31 @@ impl AudioStream {
                     // This helps ensure Arc references in the closure are dropped
                     std::thread::sleep(std::time::Duration::from_millis(50));
                     info!("Core Audio task aborted");
+                }
+            }
+            #[cfg(target_os = "linux")]
+            StreamBackend::MonitorPipe { task, child } => {
+                // Stop the pump task first so it releases the pipe, then kill
+                // the ffmpeg subprocess.
+                if let Some(task_handle) = task {
+                    info!("Aborting monitor pipe task...");
+                    task_handle.abort();
+                }
+                if let Some(mut child) = child {
+                    if let Err(e) = child.start_kill() {
+                        warn!("Failed to kill monitor capture child process: {}", e);
+                    }
+                    // Reap the child so it doesn't linger as a zombie.
+                    for _ in 0..10 {
+                        match child.try_wait() {
+                            Ok(Some(_)) => break,
+                            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                            Err(e) => {
+                                warn!("Failed to reap monitor capture child process: {}", e);
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }

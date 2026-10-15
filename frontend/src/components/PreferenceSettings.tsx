@@ -18,6 +18,39 @@ export function PreferenceSettings() {
   } = useConfig();
 
   const [notificationsEnabled, setNotificationsEnabled] = useState<boolean | null>(null);
+  const [quitBehavior, setQuitBehavior] = useState<'ask' | 'background' | 'kill' | null>(null);
+
+  // Load quit behavior for the On-Close setting
+  useEffect(() => {
+    const loadQuitBehavior = async () => {
+      try {
+        const behavior = await invoke<string>('api_get_quit_behavior');
+        if (behavior === 'background' || behavior === 'kill' || behavior === 'ask') {
+          setQuitBehavior(behavior);
+        } else {
+          setQuitBehavior('ask');
+        }
+      } catch (error) {
+        console.error('Failed to load quit behavior:', error);
+        setQuitBehavior('ask');
+      }
+    };
+    loadQuitBehavior();
+  }, []);
+
+  const handleQuitBehaviorChange = async (behavior: 'ask' | 'background' | 'kill') => {
+    const previous = quitBehavior;
+    setQuitBehavior(behavior);
+    try {
+      await invoke('api_set_quit_behavior', { behavior });
+      await Analytics.track('quit_behavior_changed', {
+        quit_behavior: behavior
+      });
+    } catch (error) {
+      console.error('Failed to save quit behavior:', error);
+      setQuitBehavior(previous);
+    }
+  };
   const [isInitialLoad, setIsInitialLoad] = useState(true);
   const [previousNotificationsEnabled, setPreviousNotificationsEnabled] = useState<boolean | null>(null);
   const hasTrackedViewRef = useRef(false);
@@ -217,6 +250,40 @@ export function PreferenceSettings() {
           <p className="text-xs text-blue-800">
             <strong>Note:</strong> Database and models are stored together in your application data directory for unified management.
           </p>
+        </div>
+      </div>
+
+      {/* On Close Section */}
+      <div className="bg-white rounded-lg border border-gray-200 p-6">
+        <div>
+          <h3 className="text-lg font-semibold text-gray-900 mb-2">On Close</h3>
+          <p className="text-sm text-gray-600 mb-4">Choose what happens when you close the Meetily window</p>
+        </div>
+        <div className="space-y-2">
+          {([
+            { value: 'ask', label: 'Ask every time', hint: 'Show a confirmation dialog on close' },
+            { value: 'background', label: 'Quit to background', hint: 'Keep running in the tray' },
+            { value: 'kill', label: 'Quit completely', hint: 'Stop the app process' },
+          ] as const).map((option) => (
+            <label
+              key={option.value}
+              className="flex items-start gap-3 p-3 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors cursor-pointer"
+            >
+              <input
+                type="radio"
+                name="quit-behavior"
+                value={option.value}
+                checked={quitBehavior === option.value}
+                onChange={() => handleQuitBehaviorChange(option.value)}
+                disabled={quitBehavior === null}
+                className="w-4 h-4 mt-0.5 text-blue-600 border-gray-300 focus:ring-blue-500 cursor-pointer"
+              />
+              <div>
+                <div className="text-sm font-medium text-gray-900">{option.label}</div>
+                <div className="text-xs text-gray-500">{option.hint}</div>
+              </div>
+            </label>
+          ))}
         </div>
       </div>
 

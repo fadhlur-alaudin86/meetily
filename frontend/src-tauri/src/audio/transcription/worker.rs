@@ -216,7 +216,9 @@ pub fn start_transcription_task<R: Runtime>(
                                             let diarizer = crate::audio::diarization::get_live_system_diarizer();
                                             Some(diarizer.identify_speaker(&chunk_data_for_diarize, chunk_id))
                                         } else {
-                                            None
+                                            // Live pipeline tags mic-dominated
+                                            // segments Microphone: the local user.
+                                            Some("ME".to_string())
                                         };
 
                                         let update = TranscriptUpdate {

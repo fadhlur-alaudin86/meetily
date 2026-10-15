@@ -267,7 +267,10 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({ transcripts, isR
         const filteredText = cleanStopWords(textToShow);
         // Show [Silence] ONLY if the ORIGINAL transcript was empty (not just after filtering)
         const originalWasEmpty = transcript.text.trim() === '';
-        const displayText = originalWasEmpty && !isStreaming ? '[Silence]' : filteredText;
+        // Prefix the diarizer speaker label when present (same format as the
+        // meeting-details transcript view).
+        const speakerPrefix = transcript.speaker ? `${transcript.speaker}: ` : '';
+        const displayText = originalWasEmpty && !isStreaming ? '[Silence]' : speakerPrefix + filteredText;
 
         // Sizer text: use cleaned version for proper sizing, fallback to [Silence] only if original was empty
         const sizerText = cleanStopWords(isStreaming ? streamingTranscript.fullText : transcript.text)

@@ -36,7 +36,7 @@ pub use super::transcription::TranscriptUpdate;
 // ============================================================================
 
 // Simple recording state tracking
-static IS_RECORDING: AtomicBool = AtomicBool::new(false);
+pub(crate) static IS_RECORDING: AtomicBool = AtomicBool::new(false);
 
 /// True for the whole `stop_recording` tail (manager taken -> `recording-stopped`
 /// emitted). `IS_RECORDING` must stay true through the tail — the frontend polls
@@ -44,6 +44,13 @@ static IS_RECORDING: AtomicBool = AtomicBool::new(false);
 /// too, otherwise a fallback queued before Stop retries against a taken manager
 /// and surfaces a spurious "Microphone fallback failed" toast.
 static IS_RECORDING_STOPPING: AtomicBool = AtomicBool::new(false);
+
+/// Whether a stop tail is currently running. The failsafe in
+/// `RecordingState::report_error` must not clear `IS_RECORDING` while this is
+/// true — the flag has to stay up through the tail (see above).
+pub(crate) fn is_stop_tail_active() -> bool {
+    IS_RECORDING_STOPPING.load(Ordering::SeqCst)
+}
 
 /// Recording is live and not being torn down — the only state in which the
 /// mic-disconnect fallback should run or report.
@@ -254,6 +261,25 @@ fn resolve_system_or_default(requested_name: Option<&str>) -> Option<Arc<super::
         }
     }
 
+    // "Default System Audio" (no explicit selection): prefer the monitor of
+    // the sink that is actually playing, then the default sink's monitor.
+    // A raw ALSA sink name can never yield speaker output.
+    #[cfg(target_os = "linux")]
+    if requested_name.is_none() {
+        use super::devices::platform::active_sink_monitor_name;
+
+        if let Some(monitor) = active_sink_monitor_name() {
+            info!("✅ Capturing system audio from active sink monitor: '{}'", monitor);
+            return Some(Arc::new(super::AudioDevice::new(
+                format!("{} (System Audio)", monitor),
+                super::DeviceType::Output,
+            )));
+        }
+        if let Some(device) = default_sink_monitor_device() {
+            return Some(device);
+        }
+    }
+
     match default_output_device() {
         Ok(device) => {
             info!("✅ Using default system audio: '{}'", device.name);
@@ -264,6 +290,23 @@ fn resolve_system_or_default(requested_name: Option<&str>) -> Option<Arc<super::
             None
         }
     }
+}
+
+/// Linux-only default: the default sink's PulseAudio/PipeWire monitor.
+/// An ALSA sink name can never carry speaker output back into a capture
+/// stream, so "Default System Audio" must resolve to "<sink>.monitor".
+/// Returns `None` when pactl is unavailable (caller falls back to
+/// `default_output_device()`).
+#[cfg(target_os = "linux")]
+fn default_sink_monitor_device() -> Option<Arc<super::AudioDevice>> {
+    use super::devices::platform::default_sink_monitor_name;
+
+    let monitor = default_sink_monitor_name()?;
+    info!("✅ Using default sink monitor for system audio: '{}'", monitor);
+    Some(Arc::new(super::AudioDevice::new(
+        format!("{} (System Audio)", monitor),
+        super::DeviceType::Output,
+    )))
 }
 
 /// Wake idle audio hardware before checking microphone callbacks, and finish

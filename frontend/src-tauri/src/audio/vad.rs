@@ -28,6 +28,16 @@ pub struct ContinuousVadProcessor {
     in_speech: bool,
     processed_samples: usize,
     speech_start_sample: usize,
+    /// Cap live speech segments at this length (ms). Continuous speech that
+    /// never pauses (e.g. nonstop commentary) would otherwise accumulate one
+    /// giant segment and withhold transcription for tens of seconds.
+    /// `None` (default) keeps legacy unbounded behavior for batch paths.
+    max_segment_ms: Option<u32>,
+    /// Samples already force-emitted since the current silero-side utterance
+    /// began. The eventual SpeechEnd carries the whole utterance, so this
+    /// prefix is dropped to avoid re-emitting it. Reset on every
+    /// SpeechStart/SpeechEnd.
+    emitted_prefix_len: usize,
     // State tracking for smart logging
     last_logged_state: bool,
 }
@@ -82,9 +92,19 @@ impl ContinuousVadProcessor {
             in_speech: false,
             processed_samples: 0,
             speech_start_sample: 0,
+            max_segment_ms: None,
+            emitted_prefix_len: 0,
             // Initialize state tracking
             last_logged_state: false,
         })
+    }
+
+    /// Bound live speech segments to at most `ms` milliseconds, emitting
+    /// force-cuts for uninterrupted speech. The silero session keeps running
+    /// underneath; its eventual SpeechEnd is trimmed to the not-yet-emitted
+    /// tail. Batch paths leave this unset (unbounded, as before).
+    pub fn set_max_segment_ms(&mut self, ms: u32) {
+        self.max_segment_ms = Some(ms);
     }
 
     /// Process incoming audio samples and return any complete speech segments
@@ -209,7 +229,21 @@ impl ContinuousVadProcessor {
                     real_sample_count
                 ));
             }
-            let samples = active_speech[..real_sample_count].to_vec();
+            // When bounded live segmentation already force-emitted part of
+            // this utterance, keep only the tail. The session buffer spans
+            // the whole utterance while `real_sample_count` measures from the
+            // watermark onward, so the tail is the LAST `real_sample_count`
+            // samples. With no force-cuts this reduces to the legacy slice.
+            // Pure Vec slicing with saturating, length-clamped math: cannot
+            // panic (unlike session-relative lookups, whose buffer is drained
+            // internally on SpeechEnd).
+            let samples = if self.emitted_prefix_len == 0 {
+                active_speech[..real_sample_count].to_vec()
+            } else {
+                let buf_len = active_speech.len();
+                let drop_len = buf_len.saturating_sub(real_sample_count);
+                active_speech[drop_len..].to_vec()
+            };
             let start_ms =
                 (self.speech_start_sample as f64 / VAD_SAMPLE_RATE as f64) * 1000.0;
             let end_ms = (real_end_sample as f64 / VAD_SAMPLE_RATE as f64) * 1000.0;
@@ -275,6 +309,8 @@ impl ContinuousVadProcessor {
                     // ~2x the file duration and sorted to the end of the transcript.
                     self.speech_start_sample = timestamp_ms * VAD_SAMPLE_RATE as usize / 1000;
                     self.current_speech.clear();
+                    // A new silero-side utterance begins: nothing emitted yet.
+                    self.emitted_prefix_len = 0;
                 }
                 VadTransition::SpeechEnd { start_timestamp_ms, end_timestamp_ms, samples } => {
                     // Only log if we were previously in speech state
@@ -284,9 +320,28 @@ impl ContinuousVadProcessor {
                     }
                     self.in_speech = false;
 
-                    // Use samples from VAD transition if available, otherwise use accumulated samples
+                    // Use samples from VAD transition if available, otherwise use accumulated samples.
+                    // When bounded live segmentation already force-emitted part of this
+                    // utterance, drop that prefix so it is not transcribed twice.
+                    // NOTE: never slice the silero session buffer here — it is drained
+                    // internally on SpeechEnd, so session-relative lookups panic.
+                    // Trimming the owned transition samples with saturating,
+                    // length-clamped math cannot panic.
+                    let already_emitted = self.emitted_prefix_len;
+                    self.emitted_prefix_len = 0;
+                    let total_len = if !samples.is_empty() {
+                        samples.len()
+                    } else {
+                        self.current_speech.len()
+                    };
+                    let drop_len = already_emitted.min(total_len);
+                    // Timestamp of the first kept sample, for the segment header.
+                    let kept_start_ms = (start_timestamp_ms * VAD_SAMPLE_RATE as usize / 1000
+                        + drop_len) as f64
+                        / VAD_SAMPLE_RATE as f64
+                        * 1000.0;
                     let speech_samples = if !samples.is_empty() {
-                        samples
+                        samples[drop_len..].to_vec()
                     } else {
                         self.current_speech.clone()
                     };
@@ -294,13 +349,13 @@ impl ContinuousVadProcessor {
                     if !speech_samples.is_empty() {
                         let segment = SpeechSegment {
                             samples: speech_samples,
-                            start_timestamp_ms: start_timestamp_ms as f64,
+                            start_timestamp_ms: kept_start_ms,
                             end_timestamp_ms: end_timestamp_ms as f64,
                             confidence: 0.9, // VAD confidence
                         };
 
                         info!("VAD: Completed speech segment: {:.1}ms duration, {} samples",
-                              end_timestamp_ms - start_timestamp_ms, segment.samples.len());
+                              end_timestamp_ms as f64 - kept_start_ms, segment.samples.len());
 
                         self.speech_segments.push_back(segment);
                     }
@@ -313,6 +368,37 @@ impl ContinuousVadProcessor {
         // Accumulate speech if we're currently in a speech state
         if self.in_speech {
             self.current_speech.extend_from_slice(chunk);
+
+            // Bounded live segmentation: force-emit overlong utterances so
+            // continuous speech surfaces as frequent chunks instead of one
+            // giant segment. The silero session keeps running underneath; its
+            // eventual SpeechEnd is trimmed to the not-yet-emitted tail.
+            if let Some(max_ms) = self.max_segment_ms {
+                let max_samples = max_ms as usize * VAD_SAMPLE_RATE as usize / 1000;
+                if self.current_speech.len() >= max_samples {
+                    let end_sample = self.speech_start_sample + self.current_speech.len();
+                    let cut_len = self.current_speech.len();
+                    let segment = SpeechSegment {
+                        samples: std::mem::take(&mut self.current_speech),
+                        start_timestamp_ms: self.speech_start_sample as f64
+                            / VAD_SAMPLE_RATE as f64
+                            * 1000.0,
+                        end_timestamp_ms: end_sample as f64 / VAD_SAMPLE_RATE as f64 * 1000.0,
+                        confidence: 0.9, // VAD confidence
+                    };
+
+                    info!(
+                        "VAD: Force-cut overlong live segment at {:.1}s (cap {}ms, {} samples)",
+                        end_sample as f64 / VAD_SAMPLE_RATE as f64,
+                        max_ms,
+                        cut_len
+                    );
+
+                    self.speech_segments.push_back(segment);
+                    self.speech_start_sample = end_sample;
+                    self.emitted_prefix_len += cut_len;
+                }
+            }
         }
 
         self.processed_samples += chunk.len();

@@ -711,6 +711,13 @@ pub struct AudioPipeline {
     recording_sender_for_mixed: Option<mpsc::UnboundedSender<AudioChunk>>,
     recording_sender_for_mic: Option<mpsc::UnboundedSender<AudioChunk>>,
     recording_sender_for_sys: Option<mpsc::UnboundedSender<AudioChunk>>,
+    // Per-source energy accumulated from mixed windows since the previous
+    // transcription emission. Used to attribute each segment to the local
+    // microphone ("ME") or to system audio (diarized SPEAKER_XX).
+    seg_mic_energy: f64,
+    seg_mic_samples: u64,
+    seg_sys_energy: f64,
+    seg_sys_samples: u64,
 }
 
 impl AudioPipeline {
@@ -750,8 +757,12 @@ impl AudioPipeline {
             VAD_REDEMPTION_TIME_MS
         };
 
-        let vad_processor =
+        let mut vad_processor =
             ContinuousVadProcessor::new(sample_rate, effective_redemption_ms)?;
+        // Bound live segments so nonstop speech (e.g. system-audio commentary)
+        // surfaces as frequent ~15s chunks instead of one giant segment.
+        // Batch paths (import/retranscribe) keep their own VAD usage uncapped.
+        vad_processor.set_max_segment_ms(15_000);
         info!(
             "VAD-driven pipeline: segments dispatched per speech burst (redemption_time={}ms)",
             effective_redemption_ms
@@ -779,7 +790,38 @@ impl AudioPipeline {
             recording_sender_for_mixed: None,  // Will be set by manager
             recording_sender_for_mic: None,
             recording_sender_for_sys: None,
+            seg_mic_energy: 0.0,
+            seg_mic_samples: 0,
+            seg_sys_energy: 0.0,
+            seg_sys_samples: 0,
         })
+    }
+
+    /// Attribute the just-completed speech segment to the local microphone
+    /// ("ME") or to system audio (diarized SPEAKER_XX downstream).
+    ///
+    /// Compares RMS energy accumulated from each source's windows since the
+    /// previous emission. The microphone wins when it is clearly dominant
+    /// (2x) or the system side is near-silent; otherwise the segment belongs
+    /// to system audio. Accumulators reset on every call, so each emitted
+    /// piece is judged on its own audio.
+    fn take_segment_origin(&mut self) -> DeviceType {
+        let mic_rms = (self.seg_mic_energy / self.seg_mic_samples.max(1) as f64).sqrt();
+        let sys_rms = (self.seg_sys_energy / self.seg_sys_samples.max(1) as f64).sqrt();
+        self.seg_mic_energy = 0.0;
+        self.seg_mic_samples = 0;
+        self.seg_sys_energy = 0.0;
+        self.seg_sys_samples = 0;
+        // Silence floor (~-68 dBFS): below this a source counts as absent.
+        const SILENCE_FLOOR: f64 = 0.0004;
+        const DOMINANCE_RATIO: f64 = 2.0;
+        if mic_rms >= SILENCE_FLOOR
+            && (sys_rms < SILENCE_FLOOR || mic_rms >= sys_rms * DOMINANCE_RATIO)
+        {
+            DeviceType::Microphone // rendered as ME downstream
+        } else {
+            DeviceType::System
+        }
     }
 
     /// Run the VAD-driven audio processing pipeline
@@ -841,6 +883,14 @@ impl AudioPipeline {
                     // STEP 2: Mix audio in fixed windows when both streams have sufficient data
                     while self.ring_buffer.can_mix() {
                         if let Some((mic_window, sys_window)) = self.ring_buffer.extract_window() {
+                            // Track per-source energy for ME-vs-system attribution
+                            // of the next emitted transcription segment.
+                            self.seg_mic_energy +=
+                                mic_window.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
+                            self.seg_mic_samples += mic_window.len() as u64;
+                            self.seg_sys_energy +=
+                                sys_window.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
+                            self.seg_sys_samples += sys_window.len() as u64;
                             // Simple mixing without aggressive ducking
                             let mixed_clean = self.mixer.mix_window(&mic_window, &sys_window);
 
@@ -865,7 +915,9 @@ impl AudioPipeline {
                                                 sample_rate: 16000,
                                                 timestamp: segment.start_timestamp_ms / 1000.0,
                                                 chunk_id: self.chunk_id_counter,
-                                                device_type: DeviceType::Microphone,  // Mixed audio
+                                                // ME when the mic dominated this piece,
+                                                // else system (diarized SPEAKER_XX).
+                                                device_type: self.take_segment_origin(),
                                             };
 
                                             if let Err(e) = self.transcription_sender.send(transcription_chunk) {
@@ -953,7 +1005,8 @@ impl AudioPipeline {
                             sample_rate: 16000,
                             timestamp: segment.start_timestamp_ms / 1000.0,
                             chunk_id: self.chunk_id_counter,
-                            device_type: DeviceType::Microphone,
+                            // Same attribution as the live path above.
+                            device_type: self.take_segment_origin(),
                         };
 
                         if let Err(e) = self.transcription_sender.send(transcription_chunk) {

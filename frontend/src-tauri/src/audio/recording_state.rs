@@ -275,11 +275,13 @@ impl RecordingState {
             if recoverable_count >= 10 {
                 log::error!("Too many recoverable errors ({}), stopping recording", recoverable_count);
                 self.stop_recording();
+                Self::sync_global_recording_flag();
             }
         } else {
             log::error!("Non-recoverable audio error: {:?}", error);
             // Stop immediately for non-recoverable errors
             self.stop_recording();
+            Self::sync_global_recording_flag();
         }
 
         *self.last_error.lock().unwrap() = Some(error.clone());
@@ -293,6 +295,18 @@ impl RecordingState {
         if count >= 15 {
             log::error!("Too many total audio errors ({}), stopping recording", count);
             self.stop_recording();
+            Self::sync_global_recording_flag();
+        }
+    }
+
+    /// Mirror a failsafe stop into the global `IS_RECORDING` flag so the
+    /// frontend's 500ms poll (and the pause guard, and the mic-fallback
+    /// guard) observe the death promptly. Without this the backend considers
+    /// the session stopped while the UI keeps showing a live recording.
+    /// Never clears the flag mid stop-tail (see `is_stop_tail_active`).
+    fn sync_global_recording_flag() {
+        if !super::recording_commands::is_stop_tail_active() {
+            super::recording_commands::IS_RECORDING.store(false, Ordering::SeqCst);
         }
     }
 

@@ -639,7 +639,7 @@ const Sidebar: React.FC = () => {
                     <Plus className="w-3.5 h-3.5 text-blue-600" />
                   </div>
                 )}
-                <span className="flex-1 break-words">{item.title}</span>
+                <span className="flex-1 min-w-0 break-words" title={item.title}>{item.title}</span>
                 {isMeetingItem && (
                   <Tooltip>
                     <TooltipTrigger asChild>
@@ -680,7 +680,7 @@ const Sidebar: React.FC = () => {
                   </Tooltip>
                 )}
                 {isMeetingItem && (
-                  <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-150">
+                  <div className="flex flex-shrink-0 items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-150">
                     <button
                       onClick={(e) => {
                         e.stopPropagation();

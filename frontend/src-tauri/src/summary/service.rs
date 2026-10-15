@@ -16,6 +16,7 @@ use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 use tokio_util::sync::CancellationToken;
@@ -32,6 +33,12 @@ struct RegisteredCancellation {
 
 static CANCELLATION_REGISTRY: LazyLock<Arc<Mutex<HashMap<String, RegisteredCancellation>>>> =
     LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+
+/// In-flight BuiltInAI summary generations (whole-pipeline, all chunks).
+/// The sidecar holds the model in VRAM; the last generation out shuts it
+/// down so VRAM is freed immediately (unload timeout 0) instead of lingering
+/// until the next summary or a config change.
+static BUILTIN_GENERATIONS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 /// Strips the first `#` heading line; returns "" if no `#` is found.
 fn strip_leading_title(markdown: &str) -> String {
@@ -608,6 +615,12 @@ impl SummaryService {
         };
 
         let client = reqwest::Client::new();
+
+        // Track builtin generations so the last one out can unload the model.
+        let is_builtin_generation = provider == LLMProvider::BuiltInAI;
+        if is_builtin_generation {
+            BUILTIN_GENERATIONS_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+        }
         let result = generate_meeting_summary(
             &client,
             &provider,
@@ -631,6 +644,29 @@ impl SummaryService {
         )
         .await;
 
+        // Last builtin generation out unloads the model immediately
+        // (timeout 0): frees VRAM instead of holding it until the next
+        // summary. Other providers are unaffected. Concurrent builtin
+        // generations are ref-counted, so a parallel summary is never
+        // unloaded from underneath.
+        if is_builtin_generation
+            && BUILTIN_GENERATIONS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst) == 1
+        {
+            if let Err(error) =
+                crate::summary::summary_engine::client::shutdown_sidecar_gracefully().await
+            {
+                warn!(
+                    "Failed to unload built-in model after summary for meeting_id {}: {}",
+                    meeting_id, error
+                );
+            } else {
+                info!(
+                    "Unloaded built-in model after summary for meeting_id {} (VRAM freed)",
+                    meeting_id
+                );
+            }
+        }
+
         let duration = start_time.elapsed().as_secs_f64();
 
         match result {
@@ -639,7 +675,7 @@ impl SummaryService {
                     "✓ Successfully processed {} chunks for meeting_id: {}. Duration: {:.2}s",
                     generated.successful_chunk_count, meeting_id, duration
                 );
-                let result_json = match build_summary_result_json(
+                let mut result_json = match build_summary_result_json(
                     &generated.final_markdown,
                     &generated.english_markdown,
                     cache_source,
@@ -655,6 +691,23 @@ impl SummaryService {
                     }
                 };
 
+                // Extract the meeting name once, up front: it is stored in the
+                // result JSON (legacy `MeetingName` key the frontend reads to
+                // refresh the title) and reused for the folder/DB rename below.
+                // Without this the folder gets renamed but the UI never learns
+                // the new title.
+                let extracted_meeting_name =
+                    extract_meeting_name_from_markdown(&generated.final_markdown)
+                        .filter(|name| !name.is_empty());
+                if let Some(ref name) = extracted_meeting_name {
+                    if let Some(obj) = result_json.as_object_mut() {
+                        obj.insert(
+                            "MeetingName".to_string(),
+                            serde_json::Value::String(name.clone()),
+                        );
+                    }
+                }
+
                 let export_json = result_json.clone();
                 match SummaryProcessesRepository::update_process_completed(
                     &pool,
@@ -667,10 +720,7 @@ impl SummaryService {
                 .await
                 {
                     Ok(true) => {
-                        if let Some(name) =
-                            extract_meeting_name_from_markdown(&generated.final_markdown)
-                                .filter(|name| !name.is_empty())
-                        {
+                        if let Some(name) = extracted_meeting_name {
                             // 1. Rename folder on disk to {YYYY-MM-DD}_{Sanitized_New_Title} and update folder_path in DB
                             crate::api::rename_meeting_folder_on_disk_and_db(&pool, &meeting_id, &name).await;
 
